@@ -57,6 +57,107 @@ astro-commerce sync run --channel all --days 7
 astro-commerce inventory-alerts --output json
 ```
 
+## Example Workflows
+
+### Daily Revenue Snapshot
+
+Sync all configured channels, then print yesterday's revenue by channel from SQLite:
+
+```bash
+astro-commerce sync run --channel all --yesterday
+
+sqlite3 ~/.ecom-sales.db '
+  SELECT channel, printf("$%.2f", SUM(revenue)) AS revenue, SUM(units) AS units
+  FROM daily_sales
+  WHERE date = date("now", "-1 day")
+  GROUP BY channel
+  ORDER BY SUM(revenue) DESC;
+'
+```
+
+### Post a Slack Daily Report
+
+Use an incoming webhook and keep the webhook URL in the environment:
+
+```bash
+export SLACK_WEBHOOK_URL="<your Slack incoming webhook URL>"
+
+astro-commerce sync run --channel all --yesterday
+
+export REPORT=$(
+  sqlite3 ~/.ecom-sales.db '
+    SELECT "- " || channel || ": $" || printf("%.2f", SUM(revenue)) || " / " || SUM(units) || " units"
+    FROM daily_sales
+    WHERE date = date("now", "-1 day")
+    GROUP BY channel
+    ORDER BY SUM(revenue) DESC;
+  '
+)
+
+python3 - <<'PY'
+import json
+import os
+import urllib.request
+
+title = "Daily commerce report"
+report = os.environ["REPORT"]
+payload = json.dumps({"text": f"*{title}*\n{report}"}).encode()
+req = urllib.request.Request(
+    os.environ["SLACK_WEBHOOK_URL"],
+    data=payload,
+    headers={"Content-Type": "application/json"},
+)
+urllib.request.urlopen(req, timeout=15).read()
+PY
+```
+
+### Product Trend Chart
+
+Generate a PNG chart from live channel data:
+
+```bash
+astro-commerce shopify sales --days 30 --match "luna" --group day --output csv \
+  | astro-commerce chart --title "Luna Shopify Revenue - Last 30 Days" --type line -o luna-shopify-30d.png
+```
+
+### Inventory Alert Digest
+
+Sync sales and inventory, then produce action items for stock planning:
+
+```bash
+astro-commerce sync run --channel all --days 30
+astro-commerce inventory-alerts --days 30 --output slack
+```
+
+To post those alerts to Slack:
+
+```bash
+export ALERTS=$(astro-commerce inventory-alerts --days 30 --output slack)
+curl -X POST -H "Content-Type: application/json" \
+  --data "$(python3 -c 'import json, os; print(json.dumps({"text": os.environ["ALERTS"]}))')" \
+  "$SLACK_WEBHOOK_URL"
+```
+
+### Composable ETL
+
+Pull from one source, inspect the records payload, then ingest it into the shared database:
+
+```bash
+astro-commerce stripe sales --yesterday --output records > stripe-yesterday.json
+python3 -m json.tool stripe-yesterday.json | head -40
+astro-commerce sync ingest < stripe-yesterday.json
+```
+
+### Demo Without Exposing Real Numbers
+
+Keep real SKUs, channels, dates, and locations while masking revenue, units, and stock counts:
+
+```bash
+astro-commerce --db /tmp/commerce-demo.db --demo sync run --days 45
+astro-commerce --db /tmp/commerce-demo.db --demo shopify sales --days 30 --group sku
+astro-commerce --db /tmp/commerce-demo.db inventory-alerts --output json
+```
+
 Use `--demo` to mask sales, revenue, unit, and inventory numbers with deterministic demo values:
 
 ```bash
