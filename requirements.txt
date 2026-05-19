@@ -1,0 +1,14 @@
+# Astro Commerce Python dependencies
+#
+# Required by API source CLIs and charting:
+# - requests: shopify-sales, shopify-inventory, amazon-sales, amazon-inventory,
+#   stripe-sales, fastspring-sales, appstore-sales
+# - PyJWT: appstore-sales JWT auth
+# - cryptography: appstore-sales private key loading/signing via PyJWT
+# - matplotlib: csv-graph chart rendering
+#
+# Standard library only: astro-commerce and sync-sales-db
+requests>=2.31
+PyJWT>=2.8
+cryptography>=42
+matplotlib>=3.8

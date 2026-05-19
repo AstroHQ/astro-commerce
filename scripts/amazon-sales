@@ -1,0 +1,448 @@
+#!/usr/bin/env python3
+"""Amazon Sales — pull sales data from Amazon Seller Central via SP-API Reports API."""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import gzip
+import io
+import json
+import os
+import sys
+import time
+from collections import defaultdict
+from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
+from ecom_table import format_sales_table
+from ecom_group import aggregate_sales, aggregate_by_sku_day, aggregate_by_day, aggregate_by_sku, aggregate_total, format_sales_csv, format_sales_json
+
+try:
+    import requests
+except ImportError:
+    sys.exit("Error: 'requests' package required. Install with: pip install requests")
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
+DEFAULT_MARKETPLACE = "ATVPDKIKX0DER"
+SP_API_BASE = "https://sellingpartnerapi-na.amazon.com"
+LWA_TOKEN_URL = "https://api.amazon.com/auth/o2/token"
+CONFIG_PATH = Path(os.environ.get("AMAZON_SP_API_CONFIG", Path.home() / ".amazon-sp-api.json"))
+
+REPORT_TYPE_PRIMARY = "GET_SALES_AND_TRAFFIC_REPORT"
+REPORT_TYPE_FALLBACK = "GET_FLAT_FILE_ALL_ORDERS_DATA_BY_ORDER_DATE_GENERAL"
+
+MAX_POLL_ATTEMPTS = 60
+POLL_INTERVAL = 10  # seconds
+
+
+def load_config() -> dict:
+    """Load config from file, then overlay environment variables."""
+    cfg = {}
+    if CONFIG_PATH.exists():
+        try:
+            cfg = json.loads(CONFIG_PATH.read_text())
+        except Exception as e:
+            print(f"Warning: could not parse {CONFIG_PATH}: {e}", file=sys.stderr)
+
+    env_map = {
+        "SP_API_REFRESH_TOKEN": "refresh_token",
+        "SP_API_LWA_APP_ID": "lwa_app_id",
+        "SP_API_LWA_CLIENT_SECRET": "lwa_client_secret",
+        "SP_API_MARKETPLACE_ID": "marketplace_id",
+        "SP_API_SELLER_ID": "seller_id",
+    }
+    for env_key, cfg_key in env_map.items():
+        val = os.environ.get(env_key)
+        if val:
+            cfg[cfg_key] = val
+
+    cfg.setdefault("marketplace_id", DEFAULT_MARKETPLACE)
+    return cfg
+
+
+def validate_config(cfg: dict):
+    for key in ("refresh_token", "lwa_app_id", "lwa_client_secret"):
+        if not cfg.get(key):
+            sys.exit(
+                f"Error: '{key}' not set. Configure in ~/.amazon-sp-api.json or set "
+                f"the corresponding SP_API_* environment variable."
+            )
+
+
+# ---------------------------------------------------------------------------
+# SP-API Auth
+# ---------------------------------------------------------------------------
+
+
+def get_access_token(cfg: dict) -> str:
+    resp = requests.post(
+        LWA_TOKEN_URL,
+        data={
+            "grant_type": "refresh_token",
+            "refresh_token": cfg["refresh_token"],
+            "client_id": cfg["lwa_app_id"],
+            "client_secret": cfg["lwa_client_secret"],
+        },
+        timeout=30,
+    )
+    if resp.status_code != 200:
+        sys.exit(f"Auth failed ({resp.status_code}): {resp.text}")
+    return resp.json()["access_token"]
+
+
+def api_headers(token: str) -> dict:
+    return {
+        "x-amz-access-token": token,
+        "Content-Type": "application/json",
+    }
+
+
+# ---------------------------------------------------------------------------
+# Rate-limit-aware request helper
+# ---------------------------------------------------------------------------
+
+
+def api_request(method: str, url: str, token: str, retries: int = 10, **kwargs):
+    for attempt in range(retries):
+        resp = requests.request(method, url, headers=api_headers(token), timeout=60, **kwargs)
+        if resp.status_code == 429:
+            wait = float(resp.headers.get("Retry-After", 2 * (attempt + 1)))
+            print(f"  Rate limited, waiting {wait}s...", file=sys.stderr)
+            time.sleep(wait)
+            continue
+        if resp.status_code == 403 and "QuotaExceeded" in resp.text:
+            time.sleep(5 * (attempt + 1))
+            continue
+        return resp
+    return resp  # return last response even if failed
+
+
+# ---------------------------------------------------------------------------
+# Reports API
+# ---------------------------------------------------------------------------
+
+
+def create_report(token: str, report_type: str, start: str, end: str, marketplace: str) -> str:
+    body = {
+        "reportType": report_type,
+        "dataStartTime": f"{start}T00:00:00Z",
+        "dataEndTime": f"{end}T23:59:59Z",
+        "marketplaceIds": [marketplace],
+    }
+    if report_type == "GET_SALES_AND_TRAFFIC_REPORT":
+        body["reportOptions"] = {"dateGranularity": "DAY", "asinGranularity": "SKU"}
+    resp = api_request("POST", f"{SP_API_BASE}/reports/2021-06-30/reports", token, json=body)
+    if resp.status_code not in (200, 201, 202):
+        sys.exit(f"Failed to create report ({resp.status_code}): {resp.text}")
+    return resp.json()["reportId"]
+
+
+def poll_report(token: str, report_id: str) -> dict:
+    for i in range(MAX_POLL_ATTEMPTS):
+        resp = api_request("GET", f"{SP_API_BASE}/reports/2021-06-30/reports/{report_id}", token)
+        if resp.status_code != 200:
+            sys.exit(f"Failed to check report status ({resp.status_code}): {resp.text}")
+        data = resp.json()
+        status = data.get("processingStatus")
+        if status == "DONE":
+            return data
+        if status in ("CANCELLED", "FATAL"):
+            sys.exit(f"Report failed with status: {status}")
+        if i % 3 == 0:
+            print(f"  Report status: {status} (attempt {i+1})...", file=sys.stderr)
+        time.sleep(POLL_INTERVAL)
+    sys.exit("Timed out waiting for report to complete.")
+
+
+def download_report(token: str, document_id: str) -> str:
+    resp = api_request(
+        "GET", f"{SP_API_BASE}/reports/2021-06-30/documents/{document_id}", token
+    )
+    if resp.status_code != 200:
+        sys.exit(f"Failed to get report document ({resp.status_code}): {resp.text}")
+    doc = resp.json()
+    url = doc["url"]
+    compression = doc.get("compressionAlgorithm")
+
+    dl = requests.get(url, timeout=120)
+    if dl.status_code != 200:
+        sys.exit(f"Failed to download report ({dl.status_code})")
+
+    if compression and compression.upper() == "GZIP":
+        return gzip.decompress(dl.content).decode("utf-8-sig")
+    return dl.content.decode("utf-8-sig")
+
+
+def _date_range(start: str, end: str):
+    current = datetime.strptime(start, "%Y-%m-%d").date()
+    final = datetime.strptime(end, "%Y-%m-%d").date()
+    while current <= final:
+        yield current.isoformat()
+        current += timedelta(days=1)
+
+
+def _fetch_daily_sku_data(
+    token: str, start: str, end: str, sku_pattern: str | None, marketplace: str
+) -> list[dict]:
+    rows = []
+    for day in _date_range(start, end):
+        print(f"Requesting report for {day}...", file=sys.stderr)
+        for report_type in [REPORT_TYPE_PRIMARY, REPORT_TYPE_FALLBACK]:
+            try:
+                report_id = create_report(token, report_type, day, day, marketplace)
+                break
+            except SystemExit:
+                if report_type == REPORT_TYPE_FALLBACK:
+                    raise
+                print("  Primary report type failed, trying fallback...", file=sys.stderr)
+        print(f"  Report ID: {report_id}", file=sys.stderr)
+        report_data = poll_report(token, report_id)
+
+        doc_id = report_data.get("reportDocumentId")
+        if not doc_id:
+            sys.exit("Error: report completed but no document ID returned.")
+
+        print("  Downloading report...", file=sys.stderr)
+        report_text = download_report(token, doc_id)
+        day_rows = parse_report(report_text, sku_pattern, "sku")
+        for row in day_rows:
+            if row.get("date") in (None, "", "all"):
+                row["date"] = day
+        rows.extend(day_rows)
+    return rows
+
+
+# ---------------------------------------------------------------------------
+# Parse & aggregate
+# ---------------------------------------------------------------------------
+
+
+def parse_report(report_text: str, sku_pattern: str | None, group: str = "sku-day") -> list[dict]:
+    """Parse report data. Handles both JSON (Sales & Traffic) and TSV formats."""
+    # Try JSON first (Sales & Traffic report)
+    try:
+        data = json.loads(report_text)
+        parsed = _parse_sales_and_traffic(data, sku_pattern)
+        if group in ("sku-day", "day"):
+            return parsed["by_date"]
+        else:
+            return parsed["by_sku"]
+    except (json.JSONDecodeError, KeyError):
+        pass
+    # Fall back to TSV
+    return _parse_tsv_report(report_text, sku_pattern)
+
+
+def _parse_sales_and_traffic(data: dict, sku_pattern: str | None) -> dict:
+    """Parse GET_SALES_AND_TRAFFIC_REPORT JSON format. Returns dict with 'by_date' and 'by_sku' lists."""
+    by_date_rows = []
+    by_sku_rows = []
+
+    for item in data.get("salesAndTrafficByDate", []):
+        dt = item.get("date", "")[:10]
+        sales = item.get("salesByDate", {})
+        qty = sales.get("unitsOrdered", 0)
+        amount_data = sales.get("orderedProductSales", {})
+        amount = amount_data.get("amount", 0.0)
+        currency = amount_data.get("currencyCode", "USD")
+        by_date_rows.append({
+            "date": dt, "sku": "ALL", "quantity": qty, "amount": amount, "currency": currency,
+        })
+
+    for item in data.get("salesAndTrafficByAsin", []):
+        sku = item.get("sku", "")
+        if sku_pattern and sku_pattern.lower() not in sku.lower():
+            continue
+        sales = item.get("salesByAsin", {})
+        qty = sales.get("unitsOrdered", 0)
+        amount_data = sales.get("orderedProductSales", {})
+        amount = amount_data.get("amount", 0.0)
+        currency = amount_data.get("currencyCode", "USD")
+        by_sku_rows.append({
+            "date": "all", "sku": sku, "quantity": qty, "amount": amount, "currency": currency,
+        })
+
+    return {"by_date": by_date_rows, "by_sku": by_sku_rows}
+
+
+def _parse_tsv_report(tsv_text: str, sku_pattern: str | None) -> list[dict]:
+    """Parse TSV order report (fallback)."""
+    reader = csv.DictReader(io.StringIO(tsv_text), delimiter="\t")
+    rows = []
+    for row in reader:
+        sku = row.get("sku") or row.get("SKU") or row.get("seller-sku") or ""
+        if sku_pattern and sku_pattern.lower() not in sku.lower():
+            continue
+        order_date_raw = row.get("purchase-date") or row.get("order-date") or ""
+        if not order_date_raw:
+            continue
+        try:
+            order_date = order_date_raw[:10]
+            datetime.strptime(order_date, "%Y-%m-%d")
+        except ValueError:
+            continue
+        qty_str = row.get("quantity") or row.get("quantity-purchased") or "0"
+        try:
+            qty = int(qty_str)
+        except ValueError:
+            qty = 0
+        amount_str = row.get("item-price") or row.get("item_price") or row.get("price") or "0"
+        try:
+            amount = float(amount_str)
+        except ValueError:
+            amount = 0.0
+        currency = row.get("currency") or row.get("Currency") or "USD"
+        rows.append({"date": order_date, "sku": sku, "quantity": qty, "amount": amount, "currency": currency})
+    return rows
+
+
+# ---------------------------------------------------------------------------
+# Output
+# ---------------------------------------------------------------------------
+
+
+def format_table(rows: list[dict], group: str = "sku-day") -> str:
+    return format_sales_table(rows, group)
+
+def format_csv(rows: list[dict], group: str = "sku-day") -> str:
+    return format_sales_csv(rows, group)
+
+
+def format_json(rows: list[dict], group: str = "sku-day") -> str:
+    return format_sales_json(rows, group)
+
+
+def format_records_payload(rows: list[dict], cfg: dict, start: str, end: str) -> str:
+    """Canonical source-neutral sync-ingestable JSON payload."""
+    records = []
+    for r in rows:
+        # Amazon Sales & Traffic can produce aggregate date rows. Keep only concrete SKUs
+        # for DB ingestion so the sales table stays keyed by real SKU.
+        if not r.get("sku") or r.get("sku") == "ALL":
+            continue
+        records.append({
+            "date": r["date"],
+            "sku": r["sku"],
+            "quantity": int(r["quantity"]),
+            "gross_revenue": round(float(r["amount"]), 2),
+            "currency": r.get("currency", "USD"),
+            "meta": {"marketplace_id": cfg.get("marketplace_id")},
+        })
+    return json.dumps({
+        "schema": "astro.commerce.sales.v1",
+        "source": "amazon",
+        "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "range": {"start": start, "end": end, "timezone": "UTC"},
+        "source_meta": {"marketplace_id": cfg.get("marketplace_id"), "seller_id": cfg.get("seller_id")},
+        "records": records,
+        "summary": {
+            "total_units": sum(r["quantity"] for r in records),
+            "total_gross_revenue": round(sum(float(r["gross_revenue"]) for r in records), 2),
+        },
+    }, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Pull sales data from Amazon Seller Central via SP-API"
+    )
+    parser.add_argument("--sku", "--match", help="Filter by SKU (case-insensitive substring match)")
+    parser.add_argument("--start", help="Start date (YYYY-MM-DD)")
+    parser.add_argument("--end", default=date.today().isoformat(), help="End date (YYYY-MM-DD, default: today)")
+    parser.add_argument("--days", type=int, help="Convenience: look back N days from today (mutually exclusive with --start)")
+    parser.add_argument("--yesterday", action="store_true", help="Shortcut: pull only yesterday's data")
+    parser.add_argument("--group", "--group-by", default="sku-day", choices=["day", "sku", "sku-day", "total"],
+                        help="Aggregation mode (default: sku-day)")
+    parser.add_argument("--output", default="table", choices=["table", "csv", "json", "records"], help="Output format")
+    parser.add_argument("--records", action="store_true", help="Output canonical sync-ingestable records JSON")
+    args = parser.parse_args()
+
+    # Handle --yesterday / --days / --start
+    date_flags = sum([args.yesterday, args.days is not None, args.start is not None])
+    if date_flags > 1:
+        sys.exit("Error: --yesterday, --days, and --start are mutually exclusive.")
+    if args.yesterday:
+        yesterday = (date.today() - timedelta(days=1)).isoformat()
+        args.start = yesterday
+        args.end = yesterday
+    elif args.days is not None:
+        args.start = (date.today() - timedelta(days=args.days)).isoformat()
+    if not args.start:
+        sys.exit("Error: --start, --days, or --yesterday is required.")
+
+    # Validate dates
+    try:
+        datetime.strptime(args.start, "%Y-%m-%d")
+        datetime.strptime(args.end, "%Y-%m-%d")
+    except ValueError:
+        sys.exit("Error: dates must be YYYY-MM-DD format.")
+
+    cfg = load_config()
+    validate_config(cfg)
+
+    print("Authenticating...", file=sys.stderr)
+    token = get_access_token(cfg)
+
+    single_day = args.start == args.end
+    effective_group = "sku-day" if args.records else args.group
+
+    # sku-day/day modes normally need per-day reports for SKU-level daily data,
+    # but a single-day request can use one Sales & Traffic report directly.
+    need_daily_reports = effective_group in ("sku-day", "day") and not single_day
+
+    if need_daily_reports:
+        rows = _fetch_daily_sku_data(token, args.start, args.end, args.sku, cfg["marketplace_id"])
+    else:
+        # Single report for the full range
+        for report_type in [REPORT_TYPE_PRIMARY, REPORT_TYPE_FALLBACK]:
+            print(f"Requesting report: {report_type}...", file=sys.stderr)
+            try:
+                report_id = create_report(token, report_type, args.start, args.end, cfg["marketplace_id"])
+                break
+            except SystemExit:
+                if report_type == REPORT_TYPE_FALLBACK:
+                    raise
+                print(f"  Primary report type failed, trying fallback...", file=sys.stderr)
+                continue
+
+        print(f"Report ID: {report_id}", file=sys.stderr)
+        report_data = poll_report(token, report_id)
+
+        doc_id = report_data.get("reportDocumentId")
+        if not doc_id:
+            sys.exit("Error: report completed but no document ID returned.")
+
+        print("Downloading report...", file=sys.stderr)
+        tsv_text = download_report(token, doc_id)
+        parse_group = effective_group
+        if effective_group == "sku-day" and single_day:
+            parse_group = "sku"
+
+        rows = parse_report(tsv_text, args.sku, parse_group)
+
+        if effective_group == "sku-day" and single_day:
+            for row in rows:
+                if row.get("date") in (None, "", "all"):
+                    row["date"] = args.start
+
+    records_rows = aggregate_by_sku_day(rows)
+    if args.records or args.output == "records":
+        print(format_records_payload(records_rows, cfg, args.start, args.end))
+        return
+
+    aggregated = aggregate_sales(rows, args.group)
+
+    formatters = {"table": format_table, "csv": format_csv, "json": format_json}
+    print(formatters[args.output](aggregated, args.group))
+
+
+if __name__ == "__main__":
+    main()

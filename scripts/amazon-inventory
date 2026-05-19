@@ -1,0 +1,276 @@
+#!/usr/bin/env python3
+"""Amazon Inventory — pull FBA inventory data from Amazon SP-API."""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import io
+import json
+import os
+import sys
+import time
+from pathlib import Path
+from ecom_table import format_inventory_table
+from datetime import datetime, timezone
+
+try:
+    import requests
+except ImportError:
+    sys.exit("Error: 'requests' package required. Install with: pip install requests")
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
+DEFAULT_MARKETPLACE = "ATVPDKIKX0DER"
+SP_API_BASE = "https://sellingpartnerapi-na.amazon.com"
+LWA_TOKEN_URL = "https://api.amazon.com/auth/o2/token"
+CONFIG_PATH = Path(os.environ.get("AMAZON_SP_API_CONFIG", Path.home() / ".amazon-sp-api.json"))
+
+
+def load_config() -> dict:
+    cfg = {}
+    if CONFIG_PATH.exists():
+        try:
+            cfg = json.loads(CONFIG_PATH.read_text())
+        except Exception as e:
+            print(f"Warning: could not parse {CONFIG_PATH}: {e}", file=sys.stderr)
+
+    env_map = {
+        "SP_API_REFRESH_TOKEN": "refresh_token",
+        "SP_API_LWA_APP_ID": "lwa_app_id",
+        "SP_API_LWA_CLIENT_SECRET": "lwa_client_secret",
+        "SP_API_MARKETPLACE_ID": "marketplace_id",
+        "SP_API_SELLER_ID": "seller_id",
+    }
+    for env_key, cfg_key in env_map.items():
+        val = os.environ.get(env_key)
+        if val:
+            cfg[cfg_key] = val
+
+    cfg.setdefault("marketplace_id", DEFAULT_MARKETPLACE)
+    return cfg
+
+
+def validate_config(cfg: dict):
+    for key in ("refresh_token", "lwa_app_id", "lwa_client_secret"):
+        if not cfg.get(key):
+            sys.exit(
+                f"Error: '{key}' not set. Configure in ~/.amazon-sp-api.json or set "
+                f"the corresponding SP_API_* environment variable."
+            )
+
+
+# ---------------------------------------------------------------------------
+# SP-API Auth
+# ---------------------------------------------------------------------------
+
+
+def get_access_token(cfg: dict) -> str:
+    resp = requests.post(
+        LWA_TOKEN_URL,
+        data={
+            "grant_type": "refresh_token",
+            "refresh_token": cfg["refresh_token"],
+            "client_id": cfg["lwa_app_id"],
+            "client_secret": cfg["lwa_client_secret"],
+        },
+        timeout=30,
+    )
+    if resp.status_code != 200:
+        sys.exit(f"Auth failed ({resp.status_code}): {resp.text}")
+    return resp.json()["access_token"]
+
+
+def api_headers(token: str) -> dict:
+    return {
+        "x-amz-access-token": token,
+        "Content-Type": "application/json",
+    }
+
+
+# ---------------------------------------------------------------------------
+# Rate-limit-aware request helper
+# ---------------------------------------------------------------------------
+
+
+def api_request(method: str, url: str, token: str, retries: int = 3, **kwargs):
+    for attempt in range(retries):
+        resp = requests.request(method, url, headers=api_headers(token), timeout=60, **kwargs)
+        if resp.status_code == 429:
+            wait = float(resp.headers.get("Retry-After", 2 * (attempt + 1)))
+            print(f"  Rate limited, waiting {wait}s...", file=sys.stderr)
+            time.sleep(wait)
+            continue
+        if resp.status_code == 403 and "QuotaExceeded" in resp.text:
+            time.sleep(5 * (attempt + 1))
+            continue
+        return resp
+    return resp
+
+
+# ---------------------------------------------------------------------------
+# FBA Inventory API
+# ---------------------------------------------------------------------------
+
+
+def fetch_inventory(token: str, marketplace_id: str, sku_filter: str | None = None) -> list[dict]:
+    """Fetch all FBA inventory summaries, handling pagination."""
+    all_items = []
+    next_token = None
+    url = f"{SP_API_BASE}/fba/inventory/v1/summaries"
+
+    while True:
+        params = {
+            "details": "true",
+            "granularityType": "Marketplace",
+            "granularityId": marketplace_id,
+            "marketplaceIds": marketplace_id,
+        }
+        if next_token:
+            params["nextToken"] = next_token
+
+        resp = api_request("GET", url, token, params=params)
+        if resp.status_code != 200:
+            sys.exit(f"Inventory API failed ({resp.status_code}): {resp.text}")
+
+        data = resp.json().get("payload", {})
+        summaries = data.get("inventorySummaries", [])
+
+        for item in summaries:
+            sku = item.get("sellerSku", "")
+            if sku_filter and sku_filter.lower() not in sku.lower():
+                continue
+
+            details = item.get("inventoryDetails", {})
+            on_hand = details.get("fulfillableQuantity", 0)
+            inbound = (
+                details.get("inboundReceivingQuantity", 0)
+                + details.get("inboundWorkingQuantity", 0)
+                + details.get("inboundShippedQuantity", 0)
+            )
+
+            all_items.append({
+                "sku": sku,
+                "on_hand": on_hand,
+                "inbound": inbound,
+                "location": "US",
+            })
+
+        next_token = data.get("nextToken")
+        if not next_token:
+            break
+
+    all_items.sort(key=lambda x: x["sku"].lower())
+    return all_items
+
+
+# ---------------------------------------------------------------------------
+# Output
+# ---------------------------------------------------------------------------
+
+
+def format_table(rows: list[dict], group: str = "sku") -> str:
+    return format_inventory_table(rows, group, include_inbound=True)
+
+def format_csv(rows: list[dict], group: str = "sku") -> str:
+    out = io.StringIO()
+    writer = csv.writer(out)
+    total_on_hand = sum(r["on_hand"] for r in rows)
+    total_inbound = sum(r["inbound"] for r in rows)
+
+    if group == "total":
+        writer.writerow(["On-Hand", "Inbound"])
+        writer.writerow([total_on_hand, total_inbound])
+    else:
+        writer.writerow(["SKU", "On-Hand", "Inbound"])
+        for r in rows:
+            writer.writerow([r["sku"], r["on_hand"], r["inbound"]])
+        writer.writerow(["TOTAL", total_on_hand, total_inbound])
+    return out.getvalue()
+
+
+def format_json(rows: list[dict], group: str = "sku") -> str:
+    total_on_hand = sum(r["on_hand"] for r in rows)
+    total_inbound = sum(r["inbound"] for r in rows)
+    payload = {
+        "group": group,
+        "summary": {
+            "total_on_hand": total_on_hand,
+            "total_inbound": total_inbound,
+        },
+    }
+    if group != "total":
+        payload["items"] = rows
+    return json.dumps(payload, indent=2)
+
+
+def format_records_payload(rows: list[dict], cfg: dict) -> str:
+    """Canonical source-neutral sync-ingestable JSON payload."""
+    records = []
+    for r in rows:
+        records.append({
+            "sku": r["sku"],
+            "location": r.get("location", cfg.get("marketplace_id", "")),
+            "on_hand": int(r.get("on_hand", 0)),
+            "inbound": int(r.get("inbound", 0)),
+            "meta": {"marketplace_id": cfg.get("marketplace_id")},
+        })
+    return json.dumps({
+        "schema": "astro.commerce.inventory.v1",
+        "source": "amazon",
+        "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "source_meta": {"marketplace_id": cfg.get("marketplace_id"), "seller_id": cfg.get("seller_id")},
+        "records": records,
+        "summary": {
+            "total_on_hand": sum(r["on_hand"] for r in records),
+            "total_inbound": sum(r["inbound"] for r in records),
+        },
+    }, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Pull FBA inventory data from Amazon SP-API"
+    )
+    parser.add_argument("--sku", "--match", help="Filter by SKU (case-insensitive substring match)")
+    parser.add_argument(
+        "--group", default="sku", choices=["sku", "total"],
+        help="Aggregation mode (default: sku)",
+    )
+    parser.add_argument(
+        "--output", default="table", choices=["table", "csv", "json", "records"],
+        help="Output format (default: table)",
+    )
+    parser.add_argument("--hide-zero", action="store_true", help="Hide SKUs where both on-hand and inbound are 0")
+    parser.add_argument("--records", action="store_true", help="Output canonical sync-ingestable records JSON")
+    args = parser.parse_args()
+
+    cfg = load_config()
+    validate_config(cfg)
+
+    print("Authenticating...", file=sys.stderr)
+    token = get_access_token(cfg)
+
+    print("Fetching inventory...", file=sys.stderr)
+    items = fetch_inventory(token, cfg["marketplace_id"], args.sku)
+
+    if args.hide_zero:
+        items = [r for r in items if r["on_hand"] != 0 or r["inbound"] != 0]
+
+    if args.records or args.output == "records":
+        print(format_records_payload(items, cfg))
+        return
+
+    formatters = {"table": format_table, "csv": format_csv, "json": format_json}
+    print(formatters[args.output](items, args.group))
+
+
+if __name__ == "__main__":
+    main()

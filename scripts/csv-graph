@@ -1,0 +1,167 @@
+#!/usr/bin/env python3
+"""Generate PNG charts from CSV input."""
+
+import argparse
+import csv
+import io
+import os
+import re
+import subprocess
+import sys
+import tempfile
+
+def looks_like_date(values, threshold=0.7):
+    pattern = re.compile(r'^\d{4}-\d{2}-\d{2}')
+    matches = sum(1 for v in values if pattern.match(str(v).strip()))
+    return matches / max(len(values), 1) >= threshold
+
+def is_numeric(values):
+    count = 0
+    for v in values:
+        try:
+            float(str(v).replace(',', ''))
+            count += 1
+        except (ValueError, TypeError):
+            pass
+    return count / max(len(values), 1) >= 0.5
+
+def parse_numeric(v):
+    try:
+        return float(str(v).replace(',', ''))
+    except (ValueError, TypeError):
+        return 0.0
+
+def main():
+    parser = argparse.ArgumentParser(description='Generate PNG charts from CSV data')
+    parser.add_argument('--file', '-f', help='CSV file path (default: stdin)')
+    parser.add_argument('--title', '-t', help='Chart title')
+    parser.add_argument('--type', choices=['bar', 'line', 'pie'], dest='chart_type', help='Chart type (default: auto-detect)')
+    parser.add_argument('--x', dest='x_col', help='X-axis column name (default: first column)')
+    parser.add_argument('--y', dest='y_cols', help='Y-axis column name(s), comma-separated (default: auto-detect numeric)')
+    parser.add_argument('-o', dest='output', help='Output PNG path (default: open with macOS Preview)')
+    parser.add_argument('--width', type=int, default=12, help='Figure width in inches (default: 12)')
+    parser.add_argument('--height', type=int, default=6, help='Figure height in inches (default: 6)')
+    parser.add_argument('--stacked', action='store_true', help='Stacked bar/area chart')
+    parser.add_argument('--keep-total', action='store_true', help='Keep TOTAL summary rows (stripped by default)')
+    parser.add_argument('--no-total', action='store_true', help='(Deprecated, now default) Skip TOTAL rows')
+    args = parser.parse_args()
+
+    try:
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+        import matplotlib.ticker as ticker
+    except ImportError:
+        print("Installing matplotlib...", file=sys.stderr)
+        subprocess.check_call([sys.executable, '-m', 'pip', 'install', 'matplotlib', '-q'])
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+        import matplotlib.ticker as ticker
+
+    # Read CSV
+    if args.file:
+        with open(args.file, 'r') as f:
+            text = f.read()
+    else:
+        text = sys.stdin.read()
+
+    reader = csv.DictReader(io.StringIO(text))
+    rows = list(reader)
+    if not rows:
+        print("Error: no data rows in CSV", file=sys.stderr)
+        sys.exit(1)
+
+    headers = list(rows[0].keys())
+
+    # Strip TOTAL rows by default
+    if not args.keep_total:
+        first_col = headers[0]
+        rows = [r for r in rows if 'TOTAL' not in str(r[first_col]).upper()]
+
+    if not rows:
+        print("Error: no data rows after filtering", file=sys.stderr)
+        sys.exit(1)
+
+    # Determine columns
+    x_col = args.x_col or headers[0]
+    if args.y_cols:
+        y_cols = [c.strip() for c in args.y_cols.split(',')]
+    else:
+        y_cols = [h for h in headers if h != x_col and is_numeric([r[h] for r in rows])]
+    if not y_cols:
+        print("Error: no numeric columns found for y-axis", file=sys.stderr)
+        sys.exit(1)
+
+    x_values = [r[x_col] for r in rows]
+    y_data = {col: [parse_numeric(r[col]) for r in rows] for col in y_cols}
+
+    # Auto-detect chart type
+    chart_type = args.chart_type
+    if not chart_type:
+        chart_type = 'line' if looks_like_date(x_values) else 'bar'
+
+    # Style
+    try:
+        plt.style.use('seaborn-v0_8')
+    except OSError:
+        try:
+            plt.style.use('seaborn')
+        except OSError:
+            pass
+
+    fig, ax = plt.subplots(figsize=(args.width, args.height))
+
+    if chart_type == 'pie':
+        values = list(y_data[y_cols[0]])
+        ax.pie(values, labels=x_values, autopct='%1.1f%%', startangle=90)
+        ax.set_aspect('equal')
+    elif chart_type == 'line':
+        for col in y_cols:
+            ax.plot(range(len(x_values)), y_data[col], marker='o', markersize=4, label=col)
+        ax.set_xticks(range(len(x_values)))
+        ax.set_xticklabels(x_values, rotation=45, ha='right')
+        ax.yaxis.set_major_formatter(ticker.FuncFormatter(lambda x, p: f'{x:,.0f}'))
+    elif chart_type == 'bar':
+        import numpy as np
+        x = np.arange(len(x_values))
+        width = 0.8 / max(len(y_cols), 1)
+        if args.stacked:
+            bottom = None
+            for col in y_cols:
+                vals = y_data[col]
+                if bottom is None:
+                    ax.bar(x, vals, 0.8, label=col)
+                    bottom = list(vals)
+                else:
+                    ax.bar(x, vals, 0.8, bottom=bottom, label=col)
+                    bottom = [b + v for b, v in zip(bottom, vals)]
+        else:
+            for i, col in enumerate(y_cols):
+                offset = (i - len(y_cols) / 2 + 0.5) * width
+                ax.bar(x + offset, y_data[col], width, label=col)
+        ax.set_xticks(x)
+        ax.set_xticklabels(x_values, rotation=45, ha='right')
+        ax.yaxis.set_major_formatter(ticker.FuncFormatter(lambda x, p: f'{x:,.0f}'))
+
+    if len(y_cols) > 1 and chart_type != 'pie':
+        ax.legend()
+    if args.title:
+        ax.set_title(args.title, fontsize=14, fontweight='bold')
+
+    plt.tight_layout()
+
+    if args.output:
+        fig.savefig(args.output, dpi=150)
+        print(f"Saved to {args.output}", file=sys.stderr)
+    else:
+        tmp = tempfile.NamedTemporaryFile(suffix='.png', delete=False)
+        fig.savefig(tmp.name, dpi=150)
+        tmp.close()
+        subprocess.run(['open', tmp.name])
+        print(f"Opened {tmp.name}", file=sys.stderr)
+
+    plt.close(fig)
+
+if __name__ == '__main__':
+    main()

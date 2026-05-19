@@ -1,0 +1,352 @@
+#!/usr/bin/env python3
+"""Stripe Sales — pull subscription sales data from Stripe REST API."""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import io
+import json
+import os
+import sys
+import time
+from collections import defaultdict
+from datetime import date, datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
+from pathlib import Path
+from ecom_table import format_sales_table
+from ecom_group import aggregate_sales, aggregate_by_sku_day, aggregate_by_day, aggregate_by_sku, aggregate_total, format_sales_csv, format_sales_json
+
+try:
+    import requests
+except ImportError:
+    sys.exit("Error: 'requests' package required. Install with: pip install requests")
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
+API_BASE = "https://api.stripe.com"
+
+
+def load_config() -> dict:
+    """Load Stripe API key from env var, config file, or STRIPE_API_CONFIG."""
+    cfg = {}
+
+    # 1. Check STRIPE_API_KEY env var
+    api_key = os.environ.get("STRIPE_API_KEY")
+    if api_key:
+        return {"api_key": api_key}
+
+    # 2. Fall back to ~/.stripe-api.json
+    default_path = Path.home() / ".stripe-api.json"
+    if default_path.exists():
+        try:
+            cfg = json.loads(default_path.read_text())
+        except Exception as e:
+            print(f"Warning: could not parse {default_path}: {e}", file=sys.stderr)
+
+    # 3. Fall back to STRIPE_API_CONFIG env var pointing to a json file
+    config_path = os.environ.get("STRIPE_API_CONFIG")
+    if config_path:
+        try:
+            cfg = json.loads(Path(config_path).read_text())
+        except Exception as e:
+            print(f"Warning: could not parse {config_path}: {e}", file=sys.stderr)
+
+    return cfg
+
+
+def validate_config(cfg: dict):
+    if not cfg.get("api_key"):
+        sys.exit(
+            "Error: Stripe API key not found. Set STRIPE_API_KEY env var, "
+            "or configure 'api_key' in ~/.stripe-api.json, "
+            "or set STRIPE_API_CONFIG to a JSON file path."
+        )
+
+
+# ---------------------------------------------------------------------------
+# Stripe API
+# ---------------------------------------------------------------------------
+
+STORE_TZ = ZoneInfo("America/Chicago")
+
+# Mapping: amount_cents → SKU, built dynamically from Stripe prices
+_amount_to_sku: dict[int, str] = {}
+
+
+def api_request(cfg: dict, endpoint: str, params: dict = None, retries: int = 3) -> requests.Response:
+    """Make an authenticated GET request to the Stripe API with retry logic."""
+    url = f"{API_BASE}{endpoint}"
+    headers = {
+        "Authorization": f"Bearer {cfg['api_key']}",
+    }
+    for attempt in range(retries):
+        resp = requests.get(url, headers=headers, params=params, timeout=60)
+        if resp.status_code == 429:
+            retry_after = float(resp.headers.get("Retry-After", 2 * (attempt + 1)))
+            print(f"  Rate limited, waiting {retry_after}s...", file=sys.stderr)
+            time.sleep(retry_after)
+            continue
+        return resp
+    return resp
+
+
+def product_name_to_sku(name: str) -> str | None:
+    """Map a Stripe product name to our internal SKU."""
+    lower = name.lower()
+    if "monthly" in lower and "workbench" in lower:
+        return "workbench-monthly"
+    if "yearly" in lower and "workbench" in lower:
+        return "workbench-yearly"
+    if "annual" in lower and "workbench" in lower:
+        return "workbench-yearly"
+    if "monthly" in lower and "studio" in lower:
+        return "studio-monthly"
+    if "yearly" in lower and "studio" in lower:
+        return "studio-yearly"
+    if "annual" in lower and "studio" in lower:
+        return "studio-yearly"
+    return None
+
+
+def build_price_map(cfg: dict):
+    """Build a mapping of amount_cents → SKU by fetching all recurring prices
+    and resolving their product names. This avoids needing invoice permissions."""
+    global _amount_to_sku
+    if _amount_to_sku:
+        return  # already built
+
+    print("  Building price→SKU map...", file=sys.stderr)
+    params = {"limit": 100, "type": "recurring"}
+    resp = api_request(cfg, "/v1/prices", params)
+    if resp.status_code != 200:
+        print(f"  Warning: could not fetch prices ({resp.status_code})", file=sys.stderr)
+        return
+
+    for price in resp.json().get("data", []):
+        if not price.get("active", False):
+            continue
+        amount = price.get("unit_amount", 0)
+        product_id = price.get("product", "")
+        if not product_id:
+            continue
+
+        # Fetch product name
+        prod_resp = api_request(cfg, f"/v1/products/{product_id}")
+        if prod_resp.status_code != 200:
+            continue
+        product_name = prod_resp.json().get("name", "")
+        sku = product_name_to_sku(product_name)
+        if sku:
+            _amount_to_sku[amount] = sku
+            print(f"    ${amount/100:.2f} → {sku} ({product_name})", file=sys.stderr)
+
+
+def charge_amount_to_sku(amount_cents: int) -> str | None:
+    """Match a charge amount to a known Workbench SKU."""
+    return _amount_to_sku.get(amount_cents)
+
+
+def fetch_charges(cfg: dict, start: str, end: str) -> list[dict]:
+    """Fetch all succeeded charges in date range, handling pagination."""
+    start_ts = int(datetime.strptime(start, "%Y-%m-%d").replace(tzinfo=STORE_TZ).timestamp())
+    # End of end day
+    end_dt = datetime.strptime(end, "%Y-%m-%d").replace(hour=23, minute=59, second=59, tzinfo=STORE_TZ)
+    end_ts = int(end_dt.timestamp())
+
+    all_charges = []
+    params = {
+        "created[gte]": start_ts,
+        "created[lte]": end_ts,
+        "limit": 100,
+    }
+
+    page = 1
+    while True:
+        print(f"  Fetching charges page {page}...", file=sys.stderr)
+        resp = api_request(cfg, "/v1/charges", params=params)
+        if resp.status_code != 200:
+            sys.exit(f"API error ({resp.status_code}): {resp.text}")
+
+        data = resp.json()
+        charges = data.get("data", [])
+        all_charges.extend(charges)
+
+        if not data.get("has_more", False) or not charges:
+            break
+
+        # Paginate with starting_after cursor
+        params["starting_after"] = charges[-1]["id"]
+        page += 1
+
+    return all_charges
+
+
+# ---------------------------------------------------------------------------
+# Parse & aggregate
+# ---------------------------------------------------------------------------
+
+
+def extract_line_items(cfg: dict, charges: list[dict], sku_pattern: str | None) -> list[dict]:
+    """Extract sales rows from charges, matching to product SKUs via price map."""
+    # Build the price→SKU map once (uses prices + products endpoints, no invoice perms needed)
+    build_price_map(cfg)
+
+    rows = []
+    for charge in charges:
+        if charge.get("status") != "succeeded":
+            continue
+        if charge.get("refunded", False):
+            continue
+
+        # Get date in store timezone
+        created = charge.get("created", 0)
+        charge_dt = datetime.fromtimestamp(created, tz=STORE_TZ)
+        charge_date = charge_dt.strftime("%Y-%m-%d")
+
+        # Amount in dollars (Stripe amounts are in cents)
+        amount_cents = charge.get("amount", 0)
+        amount = amount_cents / 100.0
+        currency = charge.get("currency", "usd").upper()
+
+        # Primary: match charge amount to a known Workbench price
+        sku = charge_amount_to_sku(amount_cents)
+
+        # Fallback: check charge metadata or description
+        if not sku:
+            metadata = charge.get("metadata", {})
+            desc = charge.get("description", "").lower()
+            for key, val in metadata.items():
+                if key.lower() in ("sku", "product"):
+                    mapped = product_name_to_sku(val)
+                    if mapped:
+                        sku = mapped
+                        break
+            if not sku:
+                if "monthly" in desc and "workbench" in desc:
+                    sku = "workbench-monthly"
+                elif ("yearly" in desc or "annual" in desc) and "workbench" in desc:
+                    sku = "workbench-yearly"
+
+        if not sku:
+            continue  # Skip charges we can't map to a known product
+
+        if sku_pattern and sku_pattern.lower() not in sku.lower():
+            continue
+
+        rows.append({
+            "date": charge_date,
+            "sku": sku,
+            "quantity": 1,
+            "amount": round(amount, 2),
+            "currency": currency,
+        })
+
+    return rows
+
+
+# ---------------------------------------------------------------------------
+# Output
+# ---------------------------------------------------------------------------
+
+
+def format_table(rows: list[dict], group: str = "sku-day") -> str:
+    return format_sales_table(rows, group)
+
+def format_csv(rows: list[dict], group: str = "sku-day") -> str:
+    return format_sales_csv(rows, group)
+
+
+def format_json(rows: list[dict], group: str = "sku-day") -> str:
+    return format_sales_json(rows, group)
+
+
+def format_records_payload(rows: list[dict], source: str, start: str, end: str, source_meta: dict | None = None) -> str:
+    """Canonical source-neutral sync-ingestable JSON payload."""
+    records = []
+    for r in rows:
+        records.append({
+            "date": r["date"],
+            "sku": r["sku"],
+            "quantity": int(r["quantity"]),
+            "gross_revenue": round(float(r["amount"]), 2),
+            "currency": r.get("currency", "USD"),
+        })
+    return json.dumps({
+        "schema": "astro.commerce.sales.v1",
+        "source": source,
+        "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "range": {"start": start, "end": end},
+        "source_meta": source_meta or {},
+        "records": records,
+        "summary": {
+            "total_units": sum(r["quantity"] for r in records),
+            "total_gross_revenue": round(sum(float(r["gross_revenue"]) for r in records), 2),
+        },
+    }, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Pull subscription sales data from Stripe REST API"
+    )
+    parser.add_argument("--sku", "--match", help="Filter by SKU (case-insensitive substring match)")
+    parser.add_argument("--start", help="Start date (YYYY-MM-DD)")
+    parser.add_argument("--end", default=date.today().isoformat(), help="End date (YYYY-MM-DD, default: today)")
+    parser.add_argument("--days", type=int, help="Convenience: look back N days from today (mutually exclusive with --start)")
+    parser.add_argument("--yesterday", action="store_true", help="Shortcut: pull only yesterday's data")
+    parser.add_argument("--group", "--group-by", default="sku-day", choices=["day", "sku", "sku-day", "total"],
+                        help="Aggregation mode (default: sku-day)")
+    parser.add_argument("--output", default="table", choices=["table", "csv", "json", "records"], help="Output format")
+    parser.add_argument("--records", action="store_true", help="Output canonical sync-ingestable records JSON (alias for --output records)")
+    args = parser.parse_args()
+
+    # Handle --yesterday / --days / --start
+    date_flags = sum([args.yesterday, args.days is not None, args.start is not None])
+    if date_flags > 1:
+        sys.exit("Error: --yesterday, --days, and --start are mutually exclusive.")
+    if args.yesterday:
+        yesterday = (date.today() - timedelta(days=1)).isoformat()
+        args.start = yesterday
+        args.end = yesterday
+    elif args.days is not None:
+        args.start = (date.today() - timedelta(days=args.days)).isoformat()
+    if not args.start:
+        sys.exit("Error: --start, --days, or --yesterday is required.")
+
+    # Validate dates
+    try:
+        datetime.strptime(args.start, "%Y-%m-%d")
+        datetime.strptime(args.end, "%Y-%m-%d")
+    except ValueError:
+        sys.exit("Error: dates must be YYYY-MM-DD format.")
+
+    cfg = load_config()
+    validate_config(cfg)
+
+    print(f"Fetching Stripe charges {args.start} to {args.end}...", file=sys.stderr)
+    charges = fetch_charges(cfg, args.start, args.end)
+    print(f"  Found {len(charges)} charges.", file=sys.stderr)
+
+    rows = extract_line_items(cfg, charges, args.sku)
+
+    records_rows = aggregate_by_sku_day(rows)
+    if args.records or args.output == "records":
+        print(format_records_payload(records_rows, "stripe", args.start, args.end))
+        return
+
+    aggregated = aggregate_sales(rows, args.group)
+
+    formatters = {"table": format_table, "csv": format_csv, "json": format_json}
+    print(formatters[args.output](aggregated, args.group))
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,1828 @@
+#!/usr/bin/env python3
+"""astro-commerce — unified CLI for commerce sales, inventory, sync, and reporting."""
+
+from __future__ import annotations
+
+import argparse
+import curses
+import getpass
+import importlib.util
+import json
+import os
+import random
+import re
+import shutil
+import sqlite3
+import subprocess
+import sys
+from pathlib import Path
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+PACKAGE_DIR = SCRIPT_DIR.parent
+if str(PACKAGE_DIR) not in sys.path:
+    sys.path.insert(0, str(PACKAGE_DIR))
+if PACKAGE_DIR.name == "skills":
+    WORKSPACE = PACKAGE_DIR.parent
+elif PACKAGE_DIR.parent.name == "skills" and (PACKAGE_DIR.parent.parent / "AGENTS.md").exists():
+    # Installed as a named skill under the workspace skills directory.
+    WORKSPACE = PACKAGE_DIR.parent.parent
+elif (PACKAGE_DIR.parent / "bin").is_dir() and (PACKAGE_DIR.parent / "AGENTS.md").exists():
+    # Development/refactor copy inside the workspace.
+    WORKSPACE = PACKAGE_DIR.parent
+else:
+    WORKSPACE = PACKAGE_DIR
+BIN_DIR = WORKSPACE / "bin"
+PACKAGE_BIN_DIR = PACKAGE_DIR / "bin"
+VENV_BIN = WORKSPACE / ".venv" / "bin"
+DEFAULT_DB_PATH = Path.home() / ".ecom-sales.db"
+DEMO_DB_PATH = Path(os.environ.get("ECOM_DEMO_DB_PATH", str(Path.home() / ".ecom-sales-demo.db")))
+ASTRO_CONFIG_PATH = WORKSPACE / ".astro-commerce.json"
+
+DATABASE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS daily_sales (
+    date         TEXT NOT NULL,
+    channel      TEXT NOT NULL,
+    sku          TEXT NOT NULL,
+    units        INTEGER NOT NULL,
+    revenue      REAL NOT NULL,
+    currency     TEXT DEFAULT 'USD',
+    product_type TEXT DEFAULT 'physical',
+    updated_at   TEXT NOT NULL,
+    PRIMARY KEY (date, channel, sku)
+);
+
+CREATE TABLE IF NOT EXISTS daily_inventory (
+    date       TEXT NOT NULL,
+    channel    TEXT NOT NULL,
+    sku        TEXT NOT NULL,
+    location   TEXT NOT NULL DEFAULT '',
+    on_hand    INTEGER NOT NULL,
+    inbound    INTEGER DEFAULT 0,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (date, channel, sku, location)
+);
+
+CREATE TABLE IF NOT EXISTS hidden_skus (
+    sku TEXT PRIMARY KEY
+);
+
+CREATE TABLE IF NOT EXISTS hidden_inventory_alerts (
+    channel  TEXT NOT NULL,
+    location TEXT NOT NULL DEFAULT '',
+    sku      TEXT NOT NULL,
+    PRIMARY KEY (channel, location, sku)
+);
+
+CREATE INDEX IF NOT EXISTS idx_sales_date ON daily_sales(date);
+CREATE INDEX IF NOT EXISTS idx_sales_sku ON daily_sales(sku);
+CREATE INDEX IF NOT EXISTS idx_inventory_date ON daily_inventory(date);
+CREATE INDEX IF NOT EXISTS idx_inventory_sku ON daily_inventory(sku);
+"""
+
+# Prefer package scripts, then package/workspace bins, then venv, then PATH.
+for p in (SCRIPT_DIR, PACKAGE_BIN_DIR, BIN_DIR, VENV_BIN):
+    if p.is_dir():
+        os.environ["PATH"] = str(p) + os.pathsep + os.environ.get("PATH", "")
+
+COMMANDS = {
+    ("shopify", "sales"): "shopify-sales",
+    ("shopify", "inventory"): "shopify-inventory",
+    ("amazon", "sales"): "amazon-sales",
+    ("amazon", "inventory"): "amazon-inventory",
+    ("stripe", "sales"): "stripe-sales",
+    ("fastspring", "sales"): "fastspring-sales",
+    ("appstore", "sales"): "appstore-sales",
+    ("sync", "run"): "sync-sales-db",
+    ("sync", "ingest"): "sync-sales-db ingest",
+    ("chart",): "csv-graph",
+    ("install",): "astro-commerce-install",
+}
+
+
+
+SERVICES = {
+    "shopify": {
+        "label": "Shopify",
+        "config_file": ".shopify-api.json",
+        "env_var": "SHOPIFY_API_CONFIG",
+        "instructions": [
+            "Store domain: Shopify admin URL, like your-store.myshopify.com.",
+            "Access token: Shopify Admin → Settings → Apps and sales channels → Develop apps → your custom app → Admin API access token.",
+            "Older api_key/api_secret auth is also supported if you already use it.",
+        ],
+        "fields": [
+            {"key": "store", "label": "Store domain", "example": "your-store.myshopify.com", "help": "Find this in your Shopify admin URL, like your-store.myshopify.com."},
+            {"key": "access_token", "label": "Admin API access token", "secret": True, "optional": True, "help": "Shopify Admin → Settings → Apps and sales channels → Develop apps → your custom app → API credentials → Admin API access token."},
+            {"key": "api_key", "label": "API key (optional legacy/client credentials)", "secret": True, "optional": True, "help": "Only needed for legacy/client-credentials auth. Find it on your Shopify custom app API credentials page."},
+            {"key": "api_secret", "label": "API secret (optional legacy/client credentials)", "secret": True, "optional": True, "help": "Only needed for legacy/client-credentials auth. Find it next to the API key on your Shopify custom app API credentials page."},
+        ],
+    },
+    "amazon": {
+        "label": "Amazon SP-API",
+        "config_file": ".amazon-sp-api.json",
+        "env_var": "AMAZON_SP_API_CONFIG",
+        "instructions": [
+            "Create/authorize an SP-API app in Seller Central → Apps & Services → Develop Apps.",
+            "Use the LWA app ID/client secret plus the refresh token from authorizing the app.",
+            "Seller ID is in Seller Central account info; marketplace_id defaults to US (ATVPDKIKX0DER).",
+        ],
+        "fields": [
+            {"key": "refresh_token", "label": "Refresh token", "secret": True, "help": "Generate this by authorizing your SP-API app in Seller Central → Apps & Services → Develop Apps."},
+            {"key": "lwa_app_id", "label": "LWA app ID", "help": "Seller Central → Apps & Services → Develop Apps → your SP-API app → Login with Amazon app ID."},
+            {"key": "lwa_client_secret", "label": "LWA client secret", "secret": True, "help": "Seller Central → Apps & Services → Develop Apps → your SP-API app → Login with Amazon client secret."},
+            {"key": "marketplace_id", "label": "Marketplace ID", "default": "ATVPDKIKX0DER", "help": "Use ATVPDKIKX0DER for Amazon US, or the marketplace ID from Amazon SP-API marketplace docs for another region."},
+            {"key": "seller_id", "label": "Seller ID", "optional": True, "help": "Seller Central → Settings → Account Info → Business Information; optional for most report calls."},
+        ],
+    },
+    "stripe": {
+        "label": "Stripe",
+        "config_file": ".stripe-api.json",
+        "env_var": "STRIPE_API_CONFIG",
+        "instructions": [
+            "Create a restricted/read-only key in Stripe Dashboard → Developers → API keys.",
+            "Use a live-mode secret key (starts with sk_live_ or rk_live_) for real sales data.",
+        ],
+        "fields": [
+            {"key": "api_key", "label": "API key", "secret": True, "help": "Stripe Dashboard → Developers → API keys. Use a live-mode secret or restricted key for real sales data."},
+        ],
+    },
+    "fastspring": {
+        "label": "FastSpring",
+        "config_file": ".fastspring-api.json",
+        "env_var": "FASTSPRING_API_CONFIG",
+        "instructions": [
+            "Create API credentials in FastSpring App → Integrations → API Credentials.",
+            "Use the Data API username and password.",
+        ],
+        "fields": [
+            {"key": "username", "label": "API username", "help": "FastSpring App → Integrations → API Credentials → Data API username."},
+            {"key": "password", "label": "API password", "secret": True, "help": "FastSpring App → Integrations → API Credentials → Data API password."},
+        ],
+    },
+    "appstore": {
+        "label": "App Store Connect",
+        "config_file": ".appstore-api.json",
+        "env_var": "ASC_API_CONFIG",
+        "instructions": [
+            "Create an API key in App Store Connect → Users and Access → Keys, then download the .p8 file.",
+            "Issuer ID and Key ID are shown on the Keys page.",
+            "Vendor Number is in App Store Connect → Payments and Financial Reports.",
+        ],
+        "fields": [
+            {"key": "issuer_id", "label": "Issuer ID", "help": "App Store Connect → Users and Access → Keys. The Issuer ID appears near the top of the Keys page."},
+            {"key": "key_id", "label": "Key ID", "help": "App Store Connect → Users and Access → Keys → the Key ID column for your API key."},
+            {"key": "private_key_path", "label": "Private key path (.p8)", "help": "Download the .p8 key once from App Store Connect → Users and Access → Keys, then enter its local file path."},
+            {"key": "vendor_number", "label": "Vendor number", "help": "App Store Connect → Payments and Financial Reports → vendor number selector/report header."},
+        ],
+    },
+}
+
+CONFIG_HINTS = {
+    "shopify": ["SHOPIFY_API_CONFIG", "~/.shopify-api.json", f"{PACKAGE_DIR}/.shopify-api.json", f"{WORKSPACE}/.shopify-api.json"],
+    "amazon": ["AMAZON_SP_API_CONFIG", "~/.amazon-sp-api.json", f"{PACKAGE_DIR}/.amazon-sp-api.json", f"{WORKSPACE}/.amazon-sp-api.json"],
+    "stripe": ["STRIPE_API_KEY", "~/.stripe-api.json", f"{PACKAGE_DIR}/.stripe-api.json", f"{WORKSPACE}/.stripe-api.json"],
+    "fastspring": ["~/.fastspring-api.json", f"{PACKAGE_DIR}/.fastspring-api.json", f"{WORKSPACE}/.fastspring-api.json"],
+    "appstore": ["ASC_ISSUER_ID/ASC_KEY_ID/ASC_PRIVATE_KEY_PATH", "~/.appstore-api.json", f"{PACKAGE_DIR}/.appstore-api.json", f"{WORKSPACE}/.appstore-api.json"],
+}
+
+USAGE = """astro-commerce — unified commerce CLI
+
+Usage:
+  astro-commerce [--db PATH] <channel> <resource> [args...]
+  astro-commerce [--db PATH] sales --channel CHANNEL [args...]
+  astro-commerce [--db PATH] inventory --channel CHANNEL [args...]
+  astro-commerce [--db PATH] inventory-alerts [--days N] [--output table|json|csv|slack]
+  astro-commerce [--db PATH] sync run [args...]
+  astro-commerce [--db PATH] sync ingest [args...]
+  astro-commerce chart [args...]
+  astro-commerce configure [--services shopify,amazon,stripe,fastspring,appstore|all] [--db PATH]
+  astro-commerce [--db PATH] doctor
+  astro-commerce install [args...]
+
+Global flags:
+  --demo  Use realistic fake sales/revenue/inventory values for output and sync demos
+  --db PATH  Override the configured SQLite database for this command
+
+Channels/resources:
+  sales --channel shopify|amazon|stripe|fastspring|appstore|all
+  inventory --channel shopify|amazon|all
+  shopify sales|inventory
+  amazon sales|inventory
+  stripe sales
+  fastspring sales
+  appstore sales
+  sync run|ingest
+  chart
+  configure
+  install
+
+Examples:
+  astro-commerce --demo shopify sales --yesterday
+  astro-commerce --demo sync run --days 30
+  astro-commerce shopify sales --yesterday --output records
+  astro-commerce shopify inventory --output records | astro-commerce sync ingest
+  astro-commerce amazon sales --days 7 --group day
+  astro-commerce sales --channel amazon --days 7 --group day
+  astro-commerce inventory --channel shopify --group total
+  astro-commerce inventory-alerts --output json
+  astro-commerce amazon inventory --output records | astro-commerce sync ingest
+  astro-commerce sync run --channel shopify --yesterday
+  astro-commerce configure
+  astro-commerce configure --services shopify,stripe
+  astro-commerce install --with-deps
+"""
+
+
+def _ensure_workspace_config_envs() -> None:
+    """Let wrapper-launched tools find configs written by `astro-commerce configure`."""
+    astro_config = _read_astro_config()
+    for meta in SERVICES.values():
+        env_var = meta["env_var"]
+        cfg_path = WORKSPACE / meta["config_file"]
+        if not os.environ.get(env_var) and cfg_path.exists():
+            os.environ[env_var] = str(cfg_path)
+    db_path = astro_config.get("database_path")
+    if db_path and not os.environ.get("ECOM_DB_PATH"):
+        os.environ["ECOM_DB_PATH"] = str(_expand(str(db_path)))
+
+
+def _expand(path: str) -> Path:
+    return Path(os.path.expandvars(os.path.expanduser(path)))
+
+
+def resolve_command(command: str) -> list[str]:
+    parts = command.split()
+    exe = parts[0]
+    local = SCRIPT_DIR / exe
+    if local.exists():
+        return [str(local), *parts[1:]]
+    found = shutil.which(exe)
+    if found:
+        return [found, *parts[1:]]
+    return [exe, *parts[1:]]
+
+
+DEMO_NUMERIC_FIELDS = {
+    "quantity", "units", "amount", "revenue", "gross_revenue", "total_revenue",
+    "total_gross_revenue", "total_units", "on_hand", "inbound", "total_on_hand",
+    "total_inbound", "available", "inventory", "income", "sales",
+}
+
+
+def _demo_seed(*parts: object) -> int:
+    text = "|".join(str(p) for p in parts if p is not None)
+    return sum((i + 1) * ord(ch) for i, ch in enumerate(text))
+
+
+def _demo_units(*parts: object, low: int = 1, high: int = 48) -> int:
+    rng = random.Random(_demo_seed(*parts))
+    return rng.randint(low, high)
+
+
+def _demo_money(*parts: object) -> float:
+    rng = random.Random(_demo_seed(*parts))
+    base = rng.choice([9.99, 14.99, 29.99, 49.99, 79.99, 99.99, 129.99])
+    mult = rng.randint(1, 18)
+    return round(base * mult, 2)
+
+
+def _demo_inventory(*parts: object) -> int:
+    rng = random.Random(_demo_seed(*parts))
+    return rng.randint(0, 480)
+
+
+def _looks_like_money_key(key: str) -> bool:
+    k = key.lower()
+    return any(word in k for word in ("amount", "revenue", "sales", "income", "price", "total_gross"))
+
+
+def _looks_like_inventory_key(key: str) -> bool:
+    k = key.lower()
+    return any(word in k for word in ("on_hand", "inbound", "inventory", "available"))
+
+
+def _looks_like_units_key(key: str) -> bool:
+    k = key.lower()
+    return any(word in k for word in ("quantity", "units", "count"))
+
+
+def _demo_json_value(value, key: str = "", context: dict | None = None):
+    context = context or {}
+    if isinstance(value, dict):
+        original = value.copy()
+        return {k: _demo_json_value(v, k, original) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_demo_json_value(v, key, context if isinstance(context, dict) else {}) for v in value]
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and key.lower() in DEMO_NUMERIC_FIELDS:
+        sku = context.get("sku") or context.get("date") or key
+        if _looks_like_money_key(key):
+            return _demo_money(key, sku)
+        if _looks_like_inventory_key(key):
+            return _demo_inventory(key, sku)
+        if _looks_like_units_key(key):
+            return _demo_units(key, sku)
+    if isinstance(value, str) and key.lower() in DEMO_NUMERIC_FIELDS:
+        try:
+            num = float(value.replace(",", ""))
+        except ValueError:
+            return value
+        sku = context.get("sku") or context.get("date") or key
+        if _looks_like_money_key(key):
+            return f"{_demo_money(key, sku):.2f}"
+        if _looks_like_inventory_key(key):
+            return str(_demo_inventory(key, sku))
+        if _looks_like_units_key(key):
+            return str(_demo_units(key, sku))
+    return value
+
+
+def _recompute_demo_summary(payload):
+    if not isinstance(payload, dict):
+        return payload
+    rows = payload.get("records") or payload.get("rows") or payload.get("items")
+    summary = payload.get("summary")
+    if not isinstance(rows, list) or not isinstance(summary, dict):
+        return payload
+
+    if rows and all(isinstance(r, dict) for r in rows):
+        if any("gross_revenue" in r or "amount" in r or "revenue" in r for r in rows):
+            total_units = sum(int(float(r.get("quantity", r.get("units", 0)) or 0)) for r in rows)
+            total_revenue = sum(float(r.get("gross_revenue", r.get("amount", r.get("revenue", 0))) or 0) for r in rows)
+            if "total_units" in summary:
+                summary["total_units"] = total_units
+            if "total_revenue" in summary:
+                summary["total_revenue"] = round(total_revenue, 2)
+            if "total_gross_revenue" in summary:
+                summary["total_gross_revenue"] = round(total_revenue, 2)
+        if any("on_hand" in r or "inbound" in r for r in rows):
+            total_on_hand = sum(int(float(r.get("on_hand", 0) or 0)) for r in rows)
+            total_inbound = sum(int(float(r.get("inbound", 0) or 0)) for r in rows)
+            if "total_on_hand" in summary:
+                summary["total_on_hand"] = total_on_hand
+            if "total_inbound" in summary:
+                summary["total_inbound"] = total_inbound
+    return payload
+
+
+def _demo_json_output(text: str) -> str | None:
+    try:
+        payload = json.loads(text)
+    except Exception:
+        return None
+    demo_payload = _demo_json_value(payload)
+    demo_payload = _recompute_demo_summary(demo_payload)
+    return json.dumps(demo_payload, indent=2) + "\n"
+
+
+def _demo_csv_output(text: str) -> str | None:
+    lines = text.splitlines()
+    if not lines or "," not in lines[0]:
+        return None
+    import csv
+    import io
+    inp = io.StringIO(text)
+    rows = list(csv.DictReader(inp))
+    if not rows:
+        return None
+    headers = list(rows[0].keys())
+    transformed_rows = []
+    total_rows = []
+    totals: dict[str, float] = {}
+    samples: dict[str, list[str]] = {}
+
+    first_header = headers[0] if headers else ""
+    for row in rows:
+        is_total = str(row.get(first_header, "")).strip().upper() == "TOTAL" or any(str(v).strip().upper() == "TOTAL" for v in row.values())
+        if is_total:
+            total_rows.append(len(transformed_rows))
+            transformed_rows.append(dict(row))
+            continue
+        context = dict(row)
+        new_row = {k: _demo_json_value(v, k, context) for k, v in row.items()}
+        transformed_rows.append(new_row)
+        for k, v in new_row.items():
+            num = _parse_demo_number(v)
+            if num is not None and not re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(v).strip()):
+                totals[k] = totals.get(k, 0.0) + num
+                samples.setdefault(k, []).append(str(v))
+
+    for idx in total_rows:
+        row = transformed_rows[idx]
+        for k in headers:
+            if k in totals and _parse_demo_number(row.get(k, "")) is not None:
+                row[k] = _format_demo_total(totals[k], samples.get(k, []), k)
+
+    out = io.StringIO()
+    writer = csv.DictWriter(out, fieldnames=headers)
+    writer.writeheader()
+    for row in transformed_rows:
+        writer.writerow(row)
+    return out.getvalue()
+
+
+def _fit_demo_token(new_value: str, old_token: str) -> str:
+    """Keep demo replacements from changing fixed-width table geometry."""
+    if len(new_value) <= len(old_token):
+        return new_value.rjust(len(old_token))
+    # Last-resort fit for very narrow columns; prefer preserving layout over magnitude.
+    return new_value[-len(old_token):]
+
+
+
+
+def _parse_demo_number(text: str) -> float | None:
+    stripped = str(text).strip().replace(",", "")
+    stripped = stripped.replace("$", "").replace("€", "").replace("£", "")
+    if not stripped:
+        return None
+    try:
+        return float(stripped)
+    except ValueError:
+        return None
+
+
+def _format_demo_total(value: float, sample_values: list[str], header: str = "") -> str:
+    header_l = header.lower()
+    has_decimal = any("." in str(v) for v in sample_values) or "revenue" in header_l or "amount" in header_l
+    if has_decimal:
+        return f"{value:,.2f}"
+    return f"{int(round(value)):,}"
+
+
+def _is_total_label(cell: str) -> bool:
+    return cell.strip().upper() == "TOTAL"
+
+def _demo_box_cell(cell: str, line_no: int, cell_no: int) -> str:
+    """Demo-transform a single boxed-table cell without changing its width."""
+    width = len(cell)
+    stripped = cell.strip()
+    if not stripped:
+        return cell
+    # Preserve dates, SKUs, labels, and mixed text.
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", stripped):
+        return cell
+    if not re.fullmatch(r"[$€£]?\d{1,3}(?:,\d{3})*(?:\.\d{2})?|\d+", stripped):
+        return cell
+
+    inner_width = max(0, width - 2) if width >= 2 and cell.startswith(" ") and cell.endswith(" ") else width
+    if "." in stripped or stripped.startswith(("$", "€", "£")):
+        prefix = stripped[0] if stripped[0] in "$€£" else ""
+        replacement = f"{prefix}{_demo_money(line_no, cell_no):,.2f}"
+    else:
+        replacement = str(_demo_units(line_no, cell_no, low=1, high=96))
+    replacement = _fit_demo_token(replacement, " " * inner_width)
+    if width >= 2 and cell.startswith(" ") and cell.endswith(" "):
+        return " " + replacement + " "
+    return replacement.rjust(width)
+
+
+def _demo_box_table_output(text: str) -> str | None:
+    """Transform Unicode boxed tables while preserving geometry and real totals."""
+    if "│" not in text:
+        return None
+
+    raw_lines = text.splitlines()
+    out_lines: list[str] = []
+    changed = False
+    headers: list[str] = []
+    in_body = False
+    totals: dict[int, float] = {}
+    samples: dict[int, list[str]] = {}
+    total_rows: list[tuple[int, list[str]]] = []
+
+    for line_no, line in enumerate(raw_lines):
+        if line.startswith("├"):
+            out_lines.append(line)
+            if headers:
+                in_body = True
+            continue
+        if "│" not in line or line.startswith(("┌", "└")):
+            out_lines.append(line)
+            continue
+
+        parts = line.split("│")
+        if len(parts) < 3:
+            out_lines.append(line)
+            continue
+
+        cells = parts[1:-1]
+        stripped_cells = [c.strip() for c in cells]
+        if not headers:
+            headers = stripped_cells
+            out_lines.append(line)
+            continue
+
+        is_total = any(_is_total_label(c) for c in cells)
+        if is_total:
+            # Keep original total row shape for now; fill it after all body rows are transformed.
+            total_rows.append((len(out_lines), parts))
+            out_lines.append(line)
+            continue
+
+        new_parts = [parts[0]]
+        for cell_no, cell in enumerate(cells, start=1):
+            new_cell = _demo_box_cell(cell, line_no, cell_no)
+            changed = changed or (new_cell != cell)
+            new_parts.append(new_cell)
+            if in_body:
+                num = _parse_demo_number(new_cell)
+                if num is not None:
+                    totals[cell_no - 1] = totals.get(cell_no - 1, 0.0) + num
+                    samples.setdefault(cell_no - 1, []).append(new_cell.strip())
+        new_parts.append(parts[-1])
+        out_lines.append("│".join(new_parts))
+
+    # Recompute TOTAL rows from transformed body rows. This keeps demo totals honest.
+    for out_idx, parts in total_rows:
+        cells = parts[1:-1]
+        new_parts = [parts[0]]
+        for idx, cell in enumerate(cells):
+            if idx in totals and _parse_demo_number(cell) is not None:
+                total_text = _format_demo_total(totals[idx], samples.get(idx, []), headers[idx] if idx < len(headers) else "")
+                inner_width = max(0, len(cell) - 2) if len(cell) >= 2 and cell.startswith(" ") and cell.endswith(" ") else len(cell)
+                fitted = _fit_demo_token(total_text, " " * inner_width)
+                new_cell = " " + fitted + " " if len(cell) >= 2 and cell.startswith(" ") and cell.endswith(" ") else fitted.rjust(len(cell))
+                changed = changed or (new_cell != cell)
+                new_parts.append(new_cell)
+            else:
+                new_parts.append(cell)
+        new_parts.append(parts[-1])
+        out_lines[out_idx] = "│".join(new_parts)
+
+    if not changed:
+        return None
+    return "\n".join(out_lines) + ("\n" if text.endswith("\n") else "")
+
+
+def _demo_table_output(text: str) -> str:
+    boxed = _demo_box_table_output(text)
+    if boxed is not None:
+        return boxed
+
+    # Preserve dates/SKUs, replace standalone numeric/currency values outside date-like tokens.
+    out_lines = []
+    for line_no, line in enumerate(text.splitlines()):
+        if line_no < 2 or set(line.strip()) <= {"-"}:
+            out_lines.append(line)
+            continue
+
+        def repl_currency(m):
+            replacement = f"{m.group(1)}{_demo_money(line_no, m.start()):,.2f}"
+            return _fit_demo_token(replacement, m.group(0))
+
+        demo = re.sub(r"([$€£]?)(?<!\d{4}-)(?<!\d{2}-)\b\d{1,3}(?:,\d{3})*(?:\.\d{2})\b", repl_currency, line)
+
+        def repl_int(m):
+            token = m.group(0)
+            # Do not touch date fragments or years.
+            start, end = m.span()
+            if (start > 0 and demo[start - 1] == "-") or (end < len(demo) and demo[end:end+1] == "-"):
+                return token
+            if len(token) == 4 and token.startswith("20"):
+                return token
+            replacement = str(_demo_units(line_no, start, low=1, high=96))
+            return _fit_demo_token(replacement, token)
+
+        demo = re.sub(r"(?<![\w.-])\d+(?![\w.-])", repl_int, demo)
+        out_lines.append(demo)
+    return "\n".join(out_lines) + ("\n" if text.endswith("\n") else "")
+
+
+def demo_transform_output(text: str) -> str:
+    transformed = _demo_json_output(text)
+    if transformed is not None:
+        return transformed
+    transformed = _demo_csv_output(text)
+    if transformed is not None:
+        return transformed
+    return _demo_table_output(text)
+
+
+def _has_arg(args: list[str], name: str) -> bool:
+    return any(a == name or a.startswith(name + "=") for a in args)
+
+
+def _consume_leading_db_arg(argv: list[str]) -> tuple[list[str], str | None, str | None]:
+    """Consume a leading global --db override without stealing command-specific flags."""
+    if not argv:
+        return argv, None, None
+    first = argv[0]
+    if first == "--db":
+        if len(argv) < 2:
+            return argv, None, "Error: --db requires a path"
+        return argv[2:], argv[1], None
+    if first.startswith("--db="):
+        value = first.split("=", 1)[1]
+        if not value:
+            return argv, None, "Error: --db requires a path"
+        return argv[1:], value, None
+    return argv, None, None
+
+
+def _insert_sync_demo_arg(argv: list[str]) -> list[str]:
+    if "--demo" in argv:
+        return argv
+    if len(argv) > 1 and argv[1] == "ingest":
+        return [argv[0], argv[1], "--demo", *argv[2:]]
+    return [argv[0], "--demo", *argv[1:]]
+
+
+def run_command(command: str, args: list[str], demo: bool = False) -> int:
+    _ensure_workspace_config_envs()
+    argv = resolve_command(command) + args
+    exe = command.split()[0]
+    source_demo_supported = exe in {
+        "shopify-sales", "shopify-inventory", "amazon-sales", "amazon-inventory",
+        "stripe-sales", "fastspring-sales", "appstore-sales",
+    }
+    sync_demo_supported = exe == "sync-sales-db"
+    if demo and not (source_demo_supported or sync_demo_supported):
+        print(f"Error: --demo is only supported for source sales/inventory and sync commands, not '{exe}'.", file=sys.stderr)
+        print("Try: astro-commerce --demo sync run --days 30", file=sys.stderr)
+        return 2
+
+    if demo and sync_demo_supported:
+        argv = _insert_sync_demo_arg(argv)
+        if not _has_arg(argv[1:], "--db") and not os.environ.get("ASTRO_COMMERCE_DB_OVERRIDE"):
+            argv = [argv[0], *argv[1:], "--db", str(DEMO_DB_PATH)]
+
+    try:
+        if demo and source_demo_supported:
+            proc = subprocess.run(argv, text=True, stdout=subprocess.PIPE)
+            if proc.stdout:
+                sys.stdout.write(demo_transform_output(proc.stdout))
+        else:
+            proc = subprocess.run(argv)
+    except FileNotFoundError:
+        print(f"Error: required command not found: {command.split()[0]}", file=sys.stderr)
+        return 127
+    return proc.returncode
+
+
+SALES_CHANNELS = ["shopify", "amazon", "stripe", "fastspring", "appstore"]
+INVENTORY_CHANNELS = ["shopify", "amazon"]
+
+
+def _enabled_or_default(candidates: list[str]) -> list[str]:
+    enabled = _read_astro_config().get("enabled_services") or []
+    selected = [s for s in enabled if s in candidates]
+    return selected or candidates
+
+
+def _print_section(title: str) -> None:
+    print(f"\n=== {title} ===")
+
+
+def _strip_channel_arg(args: list[str]) -> tuple[str, list[str]]:
+    out: list[str] = []
+    channel = ""
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg == "--channel":
+            if i + 1 >= len(args):
+                raise ValueError("--channel requires a value")
+            channel = args[i + 1]
+            i += 2
+            continue
+        if arg.startswith("--channel="):
+            channel = arg.split("=", 1)[1]
+            i += 1
+            continue
+        out.append(arg)
+        i += 1
+    return channel, out
+
+
+def direct_sales(argv: list[str], demo: bool = False) -> int:
+    parser = argparse.ArgumentParser(
+        prog="astro-commerce sales",
+        description="Pull sales directly from one commerce channel.",
+    )
+    parser.add_argument("--channel", required=True, choices=[*SALES_CHANNELS, "all"], help="Sales channel to query")
+    parser.add_argument("--sku", "--match", dest="sku", help="Filter by SKU substring")
+    parser.add_argument("--start", help="Start date (YYYY-MM-DD)")
+    parser.add_argument("--end", help="End date (YYYY-MM-DD)")
+    parser.add_argument("--days", type=int, help="Look back N days")
+    parser.add_argument("--yesterday", action="store_true", help="Pull only yesterday")
+    parser.add_argument("--group", "--group-by", default="sku-day", choices=["day", "sku", "sku-day", "total"], help="Aggregation mode")
+    parser.add_argument("--output", default="table", choices=["table", "csv", "json", "records"], help="Output format")
+    parser.add_argument("--records", action="store_true", help="Output canonical sync-ingestable records JSON")
+    # Parse for validation/help; pass original non-channel args through so source CLIs stay authoritative.
+    args = parser.parse_args(argv)
+    channel, passthrough = _strip_channel_arg(argv)
+    channels = _enabled_or_default(SALES_CHANNELS) if channel == "all" else [channel]
+    if len(channels) > 1 and (args.output != "table" or args.records):
+        print("Error: --channel all only supports table output. Use one --channel for csv/json/records.", file=sys.stderr)
+        return 2
+    rc = 0
+    for ch in channels:
+        if len(channels) > 1:
+            _print_section(f"{SERVICES[ch]['label']} Sales")
+        rc = run_command(f"{ch}-sales", passthrough, demo=demo) or rc
+    return rc
+
+
+def direct_inventory(argv: list[str], demo: bool = False) -> int:
+    parser = argparse.ArgumentParser(
+        prog="astro-commerce inventory",
+        description="Pull inventory directly from one physical commerce channel.",
+    )
+    parser.add_argument("--channel", required=True, choices=[*INVENTORY_CHANNELS, "all"], help="Inventory channel to query")
+    parser.add_argument("--sku", "--match", dest="sku", help="Filter by SKU substring")
+    parser.add_argument("--group", "--group-by", default="sku", choices=["sku", "total"], help="Aggregation mode")
+    parser.add_argument("--output", default="table", choices=["table", "csv", "json", "records"], help="Output format")
+    parser.add_argument("--hide-zero", action="store_true", help="Hide zero-quantity SKUs")
+    args = parser.parse_args(argv)
+    channel, passthrough = _strip_channel_arg(argv)
+    channels = _enabled_or_default(INVENTORY_CHANNELS) if channel == "all" else [channel]
+    if len(channels) > 1 and args.output != "table":
+        print("Error: --channel all only supports table output. Use one --channel for csv/json/records.", file=sys.stderr)
+        return 2
+    rc = 0
+    for ch in channels:
+        if len(channels) > 1:
+            _print_section(f"{SERVICES[ch]['label']} Inventory")
+        rc = run_command(f"{ch}-inventory", passthrough, demo=demo) or rc
+    return rc
+
+
+def direct_inventory_alerts(argv: list[str]) -> int:
+    from astro_commerce.inventory_alerts import (
+        add_hidden_alert,
+        api_inventory_alerts,
+        format_alerts_csv,
+        format_alerts_json,
+        format_alerts_slack,
+        format_alerts_table,
+        hidden_alerts,
+        remove_hidden_alert,
+    )
+
+    parser = argparse.ArgumentParser(
+        prog="astro-commerce inventory-alerts",
+        description="Calculate inventory alert actions across all locations from synced commerce data.",
+    )
+    parser.add_argument("--days", type=int, default=30, help="Forecast window for alert actions")
+    parser.add_argument("--output", default="table", choices=["table", "json", "csv", "slack"], help="Output format")
+    parser.add_argument("--show-hidden", action="store_true", help="Include SKUs hidden from inventory alerts")
+    parser.add_argument("--channel", help="Channel for --hide-sku/--unhide-sku, e.g. shopify or amazon")
+    parser.add_argument("--location", default="", help="Location for --hide-sku/--unhide-sku")
+    parser.add_argument("--hide-sku", action="append", default=[], help="Hide a SKU alert for the given --channel/--location tuple; can be repeated")
+    parser.add_argument("--unhide-sku", action="append", default=[], help="Unhide a SKU alert for the given --channel/--location tuple; can be repeated")
+    parser.add_argument("--list-hidden", action="store_true", help="List hidden inventory alert tuples")
+    args = parser.parse_args(argv)
+
+    db_path = str(_default_database_path())
+    if (args.hide_sku or args.unhide_sku) and not args.channel:
+        print("Error: --hide-sku/--unhide-sku require --channel so alert hiding is channel/location specific.", file=sys.stderr)
+        return 2
+    for sku in args.hide_sku:
+        add_hidden_alert(db_path, args.channel, args.location, sku)
+    for sku in args.unhide_sku:
+        remove_hidden_alert(db_path, args.channel, args.location, sku)
+    if args.list_hidden:
+        for row in hidden_alerts(db_path):
+            print(f"{row['channel']}\t{row['location']}\t{row['sku']}")
+        return 0
+
+    data = api_inventory_alerts(db_path, args.days, show_hidden=args.show_hidden)
+    if args.output == "json":
+        sys.stdout.write(format_alerts_json(data))
+    elif args.output == "csv":
+        sys.stdout.write(format_alerts_csv(data))
+    elif args.output == "slack":
+        sys.stdout.write(format_alerts_slack(data))
+    else:
+        sys.stdout.write(format_alerts_table(data))
+    return 0
+
+
+def print_help() -> int:
+    print(USAGE.rstrip())
+    return 0
+
+
+def command_help() -> int:
+    print("Available commands:\n")
+    print("  astro-commerce sales")
+    print("  astro-commerce inventory")
+    print("  astro-commerce inventory-alerts")
+    for key in sorted(COMMANDS):
+        print("  astro-commerce " + " ".join(key))
+    print("  astro-commerce configure")
+    print("  astro-commerce doctor")
+    return 0
+
+
+def _read_json(path: Path) -> dict:
+    try:
+        return json.loads(path.read_text())
+    except Exception:
+        return {}
+
+
+def _first_existing(paths: list[str]) -> Path | None:
+    for raw in paths:
+        p = _expand(raw)
+        if p.exists():
+            return p
+    return None
+
+
+def _load_config_from_env_or_paths(env_var: str | None, paths: list[str]) -> tuple[dict, str | None]:
+    if env_var and os.environ.get(env_var):
+        p = _expand(os.environ[env_var])
+        if p.exists():
+            return _read_json(p), str(p)
+        return {}, f"{env_var} points to missing file: {p}"
+    p = _first_existing(paths)
+    if p:
+        return _read_json(p), str(p)
+    return {}, None
+
+
+def _required_fields(cfg: dict, fields: list[str]) -> list[str]:
+    return [f for f in fields if not cfg.get(f)]
+
+
+def _python_package_present(import_name: str) -> bool:
+    return importlib.util.find_spec(import_name) is not None
+
+
+def _print_check(label: str, passed: bool, detail: str = "") -> bool:
+    status = "✅" if passed else "❌"
+    suffix = f" — {detail}" if detail else ""
+    print(f"  {status} {label:<28}{suffix}")
+    return passed
+
+
+def _shopify_check() -> bool:
+    cfg, source = _load_config_from_env_or_paths(
+        "SHOPIFY_API_CONFIG",
+        ["~/.shopify-api.json", f"{PACKAGE_DIR}/.shopify-api.json", f"{WORKSPACE}/.shopify-api.json"],
+    )
+    env_map = {
+        "SHOPIFY_STORE": "store",
+        "SHOPIFY_ACCESS_TOKEN": "access_token",
+        "SHOPIFY_API_KEY": "api_key",
+        "SHOPIFY_API_SECRET": "api_secret",
+    }
+    for env_key, cfg_key in env_map.items():
+        if os.environ.get(env_key):
+            cfg[cfg_key] = os.environ[env_key]
+    source = source or ("environment" if any(os.environ.get(k) for k in env_map) else None)
+
+    missing = []
+    if not cfg.get("store"):
+        missing.append("store/SHOPIFY_STORE")
+    if not (cfg.get("access_token") or (cfg.get("api_key") and cfg.get("api_secret"))):
+        missing.append("access_token or api_key+api_secret")
+    return _print_check("Shopify credentials", not missing, f"source: {source or 'none'}" if not missing else "missing " + ", ".join(missing))
+
+
+def _amazon_check() -> bool:
+    cfg, source = _load_config_from_env_or_paths(
+        "AMAZON_SP_API_CONFIG",
+        ["~/.amazon-sp-api.json", f"{PACKAGE_DIR}/.amazon-sp-api.json", f"{WORKSPACE}/.amazon-sp-api.json"],
+    )
+    env_map = {
+        "SP_API_REFRESH_TOKEN": "refresh_token",
+        "SP_API_LWA_APP_ID": "lwa_app_id",
+        "SP_API_LWA_CLIENT_SECRET": "lwa_client_secret",
+        "SP_API_MARKETPLACE_ID": "marketplace_id",
+        "SP_API_SELLER_ID": "seller_id",
+    }
+    for env_key, cfg_key in env_map.items():
+        if os.environ.get(env_key):
+            cfg[cfg_key] = os.environ[env_key]
+    source = source or ("environment" if any(os.environ.get(k) for k in env_map) else None)
+
+    missing = _required_fields(cfg, ["refresh_token", "lwa_app_id", "lwa_client_secret"])
+    return _print_check("Amazon SP-API credentials", not missing, f"source: {source or 'none'}" if not missing else "missing " + ", ".join(missing))
+
+
+def _stripe_check() -> bool:
+    cfg, source = _load_config_from_env_or_paths(
+        "STRIPE_API_CONFIG",
+        ["~/.stripe-api.json", f"{PACKAGE_DIR}/.stripe-api.json", f"{WORKSPACE}/.stripe-api.json"],
+    )
+    if os.environ.get("STRIPE_API_KEY"):
+        cfg["api_key"] = os.environ["STRIPE_API_KEY"]
+        source = "environment"
+    missing = _required_fields(cfg, ["api_key"])
+    return _print_check("Stripe API key", not missing, f"source: {source or 'none'}" if not missing else "missing api_key/STRIPE_API_KEY")
+
+
+def _fastspring_check() -> bool:
+    cfg, source = _load_config_from_env_or_paths(
+        "FASTSPRING_API_CONFIG",
+        [f"{PACKAGE_DIR}/.fastspring-api.json", f"{WORKSPACE}/.fastspring-api.json", "~/.fastspring-api.json"],
+    )
+    if os.environ.get("FASTSPRING_USERNAME"):
+        cfg["username"] = os.environ["FASTSPRING_USERNAME"]
+        source = source or "environment"
+    if os.environ.get("FASTSPRING_PASSWORD"):
+        cfg["password"] = os.environ["FASTSPRING_PASSWORD"]
+        source = source or "environment"
+    missing = _required_fields(cfg, ["username", "password"])
+    return _print_check("FastSpring credentials", not missing, f"source: {source or 'none'}" if not missing else "missing " + ", ".join(missing))
+
+
+def _appstore_check() -> bool:
+    cfg, source = _load_config_from_env_or_paths(
+        "ASC_API_CONFIG",
+        [f"{PACKAGE_DIR}/.appstore-api.json", f"{WORKSPACE}/.appstore-api.json", "~/.appstore-api.json"],
+    )
+    env_map = {
+        "ASC_ISSUER_ID": "issuer_id",
+        "ASC_KEY_ID": "key_id",
+        "ASC_PRIVATE_KEY_PATH": "private_key_path",
+        "ASC_VENDOR_NUMBER": "vendor_number",
+    }
+    for env_key, cfg_key in env_map.items():
+        if os.environ.get(env_key):
+            cfg[cfg_key] = os.environ[env_key]
+    source = source or ("environment" if any(os.environ.get(k) for k in env_map) else None)
+
+    key_path_raw = cfg.get("private_key_path")
+    if key_path_raw and not os.path.isabs(key_path_raw) and source and source != "environment" and not source.startswith("ASC_API_CONFIG points"):
+        key_path = Path(source).parent / key_path_raw
+    elif key_path_raw:
+        key_path = _expand(key_path_raw)
+    else:
+        key_path = None
+
+    missing = _required_fields(cfg, ["issuer_id", "key_id", "private_key_path", "vendor_number"])
+    ok = not missing
+    detail = f"source: {source or 'none'}" if ok else "missing " + ", ".join(missing)
+    if ok and key_path and not key_path.exists():
+        ok = False
+        detail = f"private key file missing: {key_path}"
+    return _print_check("App Store Connect auth", ok, detail)
+
+
+def _dependency_checks() -> bool:
+    deps = [
+        ("requests", "requests", "API CLIs"),
+        ("jwt", "PyJWT", "App Store JWT auth"),
+        ("cryptography", "cryptography", "App Store private-key signing"),
+        ("matplotlib", "matplotlib", "csv-graph chart rendering"),
+    ]
+    ok = True
+    print("\nPython dependencies:")
+    for import_name, package_name, purpose in deps:
+        present = _python_package_present(import_name)
+        ok = _print_check(package_name, present, purpose if present else f"missing; needed for {purpose}") and ok
+    return ok
+
+
+
+def _read_astro_config() -> dict:
+    return _read_json(ASTRO_CONFIG_PATH) if ASTRO_CONFIG_PATH.exists() else {}
+
+
+def _write_json_secure(path: Path, data: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
+    os.chmod(tmp, 0o600)
+    tmp.replace(path)
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
+def _default_database_path(astro_config: dict | None = None) -> Path:
+    if os.environ.get("ECOM_DB_PATH"):
+        return _expand(os.environ["ECOM_DB_PATH"])
+    astro_config = astro_config if astro_config is not None else _read_astro_config()
+    if astro_config.get("database_path"):
+        return _expand(str(astro_config["database_path"]))
+    return DEFAULT_DB_PATH
+
+
+def _initialize_database(db_path: Path) -> None:
+    db_path = _expand(str(db_path))
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(db_path)
+    try:
+        tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+        if "daily_inventory" in tables:
+            inventory_cols = [r[1] for r in conn.execute("PRAGMA table_info(daily_inventory)").fetchall()]
+            if "location" not in inventory_cols:
+                conn.execute("ALTER TABLE daily_inventory RENAME TO daily_inventory_old")
+                conn.executescript(DATABASE_SCHEMA)
+                conn.execute(
+                    "INSERT OR IGNORE INTO daily_inventory (date, channel, sku, location, on_hand, inbound, updated_at) "
+                    "SELECT date, channel, sku, '', on_hand, inbound, updated_at FROM daily_inventory_old"
+                )
+                conn.execute("DROP TABLE daily_inventory_old")
+            else:
+                conn.executescript(DATABASE_SCHEMA)
+        else:
+            conn.executescript(DATABASE_SCHEMA)
+
+        tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+        if "daily_sales" in tables:
+            sales_cols = [r[1] for r in conn.execute("PRAGMA table_info(daily_sales)").fetchall()]
+            if "product_type" not in sales_cols:
+                conn.execute("ALTER TABLE daily_sales ADD COLUMN product_type TEXT DEFAULT 'physical'")
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _database_check() -> bool:
+    db_path = _default_database_path()
+    if not db_path.exists():
+        return _print_check("SQLite database", False, f"missing: {db_path}; run astro-commerce configure")
+    try:
+        conn = sqlite3.connect(db_path)
+        try:
+            tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+            sales_cols = {r[1] for r in conn.execute("PRAGMA table_info(daily_sales)").fetchall()}
+            inventory_cols = {r[1] for r in conn.execute("PRAGMA table_info(daily_inventory)").fetchall()}
+        finally:
+            conn.close()
+    except sqlite3.Error as e:
+        return _print_check("SQLite database", False, f"{db_path}: {e}")
+
+    required_tables = {"daily_sales", "daily_inventory", "hidden_skus"}
+    missing_tables = required_tables - tables
+    missing_cols = []
+    if "product_type" not in sales_cols:
+        missing_cols.append("daily_sales.product_type")
+    if "location" not in inventory_cols:
+        missing_cols.append("daily_inventory.location")
+    if missing_tables or missing_cols:
+        detail = ", ".join([*(f"missing table {t}" for t in sorted(missing_tables)), *missing_cols])
+        return _print_check("SQLite database", False, detail)
+    return _print_check("SQLite database", True, str(db_path))
+
+
+def _prompt_database_path(astro_config: dict) -> Path:
+    default_path = _default_database_path(astro_config)
+    while True:
+        value = input(f"Database path [{default_path}]: ").strip()
+        path = _expand(value) if value else default_path
+        if path.exists() and path.is_dir():
+            print("Please enter a database file path, not a directory.")
+            continue
+        return path
+
+
+def _parse_services(raw: str) -> list[str]:
+    parts = [p.strip().lower() for p in raw.split(",") if p.strip()]
+    if not parts or parts == ["all"]:
+        return list(SERVICES)
+    unknown = [p for p in parts if p not in SERVICES]
+    if unknown:
+        raise ValueError("unknown service(s): " + ", ".join(unknown))
+    return list(dict.fromkeys(parts))
+
+
+def _prompt_yes_no(prompt: str, default: bool = False) -> bool:
+    suffix = "[Y/n]" if default else "[y/N]"
+    while True:
+        answer = input(f"{prompt} {suffix} ").strip().lower()
+        if not answer:
+            return default
+        if answer in ("y", "yes"):
+            return True
+        if answer in ("n", "no"):
+            return False
+        print("Please answer y or n.")
+
+
+def _prompt_field(field: dict, existing: dict) -> str:
+    key = field["key"]
+    label = field["label"]
+    current = existing.get(key)
+    default = current or field.get("default") or ""
+    example = f" (example: {field['example']})" if field.get("example") else ""
+    required = "" if field.get("optional") else " required"
+
+    if field.get("secret"):
+        hint = " [leave blank to keep existing]" if current else ""
+        value = getpass.getpass(f"  {label}{example}{required}{hint}: ")
+        return current if value == "" and current else value
+
+    suffix = f" [{default}]" if default else ""
+    value = input(f"  {label}{example}{required}{suffix}: ").strip()
+    return value or default
+
+
+def _service_config_valid(service: str, cfg: dict, cfg_path: Path | None = None) -> tuple[bool, str]:
+    if service == "shopify":
+        if not cfg.get("store"):
+            return False, "missing store"
+        if not (cfg.get("access_token") or (cfg.get("api_key") and cfg.get("api_secret"))):
+            return False, "missing access_token or api_key+api_secret"
+        return True, ""
+    if service == "amazon":
+        missing = _required_fields(cfg, ["refresh_token", "lwa_app_id", "lwa_client_secret"])
+        return (not missing, "missing " + ", ".join(missing) if missing else "")
+    if service == "stripe":
+        missing = _required_fields(cfg, ["api_key"])
+        return (not missing, "missing api_key" if missing else "")
+    if service == "fastspring":
+        missing = _required_fields(cfg, ["username", "password"])
+        return (not missing, "missing " + ", ".join(missing) if missing else "")
+    if service == "appstore":
+        missing = _required_fields(cfg, ["issuer_id", "key_id", "private_key_path", "vendor_number"])
+        if missing:
+            return False, "missing " + ", ".join(missing)
+        key_path_raw = cfg["private_key_path"]
+        key_path = Path(key_path_raw)
+        if not key_path.is_absolute() and cfg_path is not None:
+            key_path = cfg_path.parent / key_path
+        else:
+            key_path = _expand(key_path_raw)
+        if not key_path.exists():
+            return False, f"private key file not found: {key_path}"
+        return True, ""
+    return False, "unknown service"
+
+
+def _configure_service(name: str, config_dir: Path) -> bool:
+    """Non-TTY fallback prompt for one service's credentials and save its config file."""
+    meta = SERVICES[name]
+    cfg_path = config_dir / meta["config_file"]
+    existing = _read_json(cfg_path) if cfg_path.exists() else {}
+
+    print(f"\n━━ {meta['label']} ━━")
+    for line in meta["instructions"]:
+        print(f"  • {line}")
+    print(f"  Config file: {cfg_path}")
+    print("  Leave a field blank to keep an existing/default value.\n")
+
+    cfg = dict(existing)
+    for field in meta["fields"]:
+        value = _prompt_field(field, existing)
+        if value != "":
+            cfg[field["key"]] = value
+        elif field["key"] in cfg and not field.get("optional"):
+            cfg.pop(field["key"], None)
+
+    ok, detail = _service_config_valid(name, cfg, cfg_path)
+    if not ok:
+        print(f"  ⚠️  {meta['label']} not enabled: {detail}", file=sys.stderr)
+        return False
+
+    _write_json_secure(cfg_path, cfg)
+    os.environ[meta["env_var"]] = str(cfg_path)
+    print(f"  ✅ Enabled {meta['label']} and saved config")
+    return True
+
+
+def _configure_form_metadata(name: str, config_dir: Path) -> dict:
+    meta = SERVICES[name]
+    cfg_path = config_dir / meta["config_file"]
+    existing = _read_json(cfg_path) if cfg_path.exists() else {}
+    fields = []
+    for field in meta["fields"]:
+        fields.append({
+            "key": field["key"],
+            "label": field["label"],
+            "help": field.get("help", ""),
+            "example": field.get("example", ""),
+            "optional": bool(field.get("optional")),
+            "secret": bool(field.get("secret")),
+            "default": field.get("default"),
+            "has_value": bool(existing.get(field["key"])),
+        })
+    ok, detail = _service_config_valid(name, existing, cfg_path)
+    return {
+        "key": name,
+        "label": meta["label"],
+        "instructions": meta["instructions"],
+        "config_file": str(cfg_path),
+        "configured": ok,
+        "detail": detail,
+        "fields": fields,
+    }
+
+
+def _configure_service_from_values(name: str, values: dict, config_dir: Path) -> tuple[bool, str]:
+    meta = SERVICES[name]
+    cfg_path = config_dir / meta["config_file"]
+    existing = _read_json(cfg_path) if cfg_path.exists() else {}
+    cfg = dict(existing)
+
+    for field in meta["fields"]:
+        key = field["key"]
+        if key not in values:
+            continue
+        value = values[key]
+        if value is None:
+            value = ""
+        value = str(value).strip()
+        if value:
+            cfg[key] = value
+        elif field.get("secret") and existing.get(key):
+            cfg[key] = existing[key]
+        elif field.get("default") is not None:
+            cfg[key] = field["default"]
+        elif field.get("optional"):
+            cfg.pop(key, None)
+        else:
+            cfg.pop(key, None)
+
+    ok, detail = _service_config_valid(name, cfg, cfg_path)
+    if not ok:
+        return False, detail
+
+    _write_json_secure(cfg_path, cfg)
+    os.environ[meta["env_var"]] = str(cfg_path)
+    return True, f"Enabled {meta['label']} and saved config"
+
+
+def _safe_addstr(stdscr, y: int, x: int, text: str, attr: int = 0) -> None:
+    height, width = stdscr.getmaxyx()
+    if y < 0 or y >= height or x >= width:
+        return
+    text = text[: max(0, width - x - 1)]
+    if not text:
+        return
+    try:
+        stdscr.addstr(y, x, text, attr)
+    except curses.error:
+        pass
+
+
+def _draw_configure_tui(stdscr, enabled: set[str], selected: int, message: str = "") -> None:
+    stdscr.erase()
+    curses.curs_set(0)
+    _tui_init_colors()
+
+    service_names = list(SERVICES)
+    rows = [*service_names, "all", "done"]
+    line_x = 1
+    text_x = 5
+    y = 1
+    line_attr = _tui_attr(3, curses.A_DIM) | curses.A_DIM
+    prompt_attr = _tui_attr(2, curses.A_BOLD)
+    current_attr = _tui_attr(1, curses.A_BOLD)
+    done_attr = _tui_attr(4, curses.A_BOLD)
+    answer_attr = _tui_attr(3, curses.A_NORMAL)
+    help_attr = _tui_attr(3, curses.A_NORMAL)
+    warn_attr = _tui_attr(6, curses.A_BOLD)
+
+    max_line_y = min(curses.LINES - 2, y + (len(rows) * 3))
+    _draw_timeline_line(stdscr, line_x, 0, max_line_y, line_attr)
+
+    _safe_addstr(stdscr, y, line_x, "◇", done_attr)
+    _safe_addstr(stdscr, y, text_x, "Configure services", prompt_attr)
+    _safe_addstr(stdscr, y + 1, text_x, "Choose which commerce services astro-commerce should use", answer_attr)
+    y += 4
+
+    for idx, row in enumerate(rows):
+        active = idx == selected
+        marker = "◆" if active else "◇"
+        marker_attr = current_attr if active else done_attr
+        text_attr = prompt_attr if active else answer_attr
+        _safe_addstr(stdscr, y, line_x, marker, marker_attr)
+
+        if row in SERVICES:
+            meta = SERVICES[row]
+            status = "enabled" if row in enabled else "disabled"
+            label = f"{meta['label']}"
+            detail = f"{status} · Enter configure · Space disable" if row in enabled else "disabled · Enter enable/configure"
+        elif row == "all":
+            label = "Configure all services"
+            detail = "Walk through every service one at a time"
+        else:
+            label = "Done"
+            detail = "Save enabled services and exit"
+
+        _safe_addstr(stdscr, y, text_x, label, text_attr)
+        _safe_addstr(stdscr, y + 1, text_x, detail, answer_attr)
+        y += 3
+
+    _safe_addstr(stdscr, min(curses.LINES - 4, y + 1), text_x, "↑/↓ move · Enter select · Space disable enabled · A all · Q done", help_attr)
+    if message:
+        _safe_addstr(stdscr, min(curses.LINES - 3, y + 2), text_x, message, warn_attr)
+    stdscr.refresh()
+
+
+def _tui_init_colors() -> None:
+    try:
+        if not curses.has_colors():
+            return
+        curses.start_color()
+        try:
+            curses.use_default_colors()
+            bg = -1
+        except curses.error:
+            bg = curses.COLOR_BLACK
+        curses.init_pair(1, curses.COLOR_CYAN, bg)    # current marker/input guide
+        curses.init_pair(2, curses.COLOR_RED, bg)     # prompt labels (close to OpenClaw orange)
+        curses.init_pair(3, curses.COLOR_BLACK, bg)   # readable secondary text
+        curses.init_pair(4, curses.COLOR_GREEN, bg)   # completed marker
+        curses.init_pair(5, curses.COLOR_BLUE, bg)    # active branch line
+        curses.init_pair(6, curses.COLOR_YELLOW, bg)  # warnings
+    except curses.error:
+        pass
+
+
+def _tui_attr(pair: int, fallback: int = 0) -> int:
+    try:
+        return curses.color_pair(pair) or fallback
+    except curses.error:
+        return fallback
+
+
+def _field_prompt(field: dict, service_label: str) -> str:
+    label = field["label"].strip()
+    lower = label.lower()
+    if lower.startswith(("enter ", "choose ", "select ")):
+        return label
+    if "store domain" in lower:
+        return "Enter Shopify store domain"
+    if "private key path" in lower:
+        return "Enter App Store Connect private key path"
+    return f"Enter {service_label} {label}"
+
+
+def _secret_status(field: dict, value: str, existing: dict) -> str:
+    if not field.get("secret"):
+        return value
+    if value:
+        return "█" * min(len(value), 24)
+    if existing.get(field["key"]):
+        return "(saved; press Enter to keep)"
+    return ""
+
+
+def _field_answer(field: dict, value: str, existing: dict) -> str:
+    if value:
+        return _secret_status(field, value, existing)
+    if field.get("secret") and existing.get(field["key"]):
+        return "(kept saved value)"
+    if field.get("default") is not None:
+        return str(field["default"])
+    if field.get("optional"):
+        return "(skipped)"
+    return ""
+
+
+def _form_to_config(fields: list[dict], values: list[str], existing: dict) -> dict:
+    cfg = dict(existing)
+    for field, value in zip(fields, values):
+        key = field["key"]
+        if value != "":
+            cfg[key] = value
+        elif field.get("secret") and existing.get(key):
+            cfg[key] = existing[key]
+        elif field.get("default") is not None:
+            cfg[key] = field["default"]
+        elif key in cfg and not field.get("optional"):
+            cfg.pop(key, None)
+    return cfg
+
+
+def _draw_timeline_line(stdscr, x: int, y1: int, y2: int, attr: int) -> None:
+    for y in range(max(0, y1), max(y1, y2) + 1):
+        _safe_addstr(stdscr, y, x, "│", attr)
+
+
+def _draw_service_step(
+    stdscr,
+    name: str,
+    config_dir: Path,
+    fields: list[dict],
+    values: list[str],
+    index: int,
+    value: str,
+    existing: dict,
+    message: str = "",
+) -> None:
+    meta = SERVICES[name]
+    field = fields[index]
+    stdscr.erase()
+    curses.curs_set(1)
+    _tui_init_colors()
+
+    line_x = 1
+    text_x = 5
+    y = 1
+    line_attr = _tui_attr(3, curses.A_DIM) | curses.A_DIM
+    done_attr = _tui_attr(4, curses.A_BOLD)
+    current_attr = _tui_attr(1, curses.A_BOLD)
+    prompt_attr = _tui_attr(2, curses.A_BOLD)
+    answer_attr = _tui_attr(3, curses.A_NORMAL)
+    help_attr = _tui_attr(3, curses.A_NORMAL)
+    warn_attr = _tui_attr(6, curses.A_BOLD)
+
+    # OpenClaw-style vertical progress rail.
+    max_line_y = min(curses.LINES - 2, y + (len(values) * 4) + 5)
+    _draw_timeline_line(stdscr, line_x, 0, max_line_y, line_attr)
+
+    service_label = meta["label"]
+    for done_index, done_value in enumerate(values):
+        done_field = fields[done_index]
+        _safe_addstr(stdscr, y, line_x, "◇", done_attr)
+        _safe_addstr(stdscr, y, text_x, _field_prompt(done_field, service_label), prompt_attr)
+        _safe_addstr(stdscr, y + 1, text_x, _field_answer(done_field, done_value, existing), answer_attr)
+        y += 4
+
+    help_text = field.get("help")
+    if help_text:
+        _safe_addstr(stdscr, y, text_x, help_text, help_attr)
+        y += 2
+
+    _safe_addstr(stdscr, y, line_x, "◆", current_attr)
+    _safe_addstr(stdscr, y, text_x, _field_prompt(field, service_label), prompt_attr)
+    display = _secret_status(field, value, existing)
+    input_y = y + 2
+    input_x = text_x
+    if display:
+        _safe_addstr(stdscr, input_y, input_x, display)
+    elif field.get("example"):
+        _safe_addstr(stdscr, input_y, input_x, f"example: {field['example']}", help_attr)
+    elif field.get("default") is not None:
+        _safe_addstr(stdscr, input_y, input_x, f"default: {field['default']}", help_attr)
+    elif field.get("secret") and existing.get(field["key"]):
+        _safe_addstr(stdscr, input_y, input_x, "saved value will be kept if blank", help_attr)
+
+    # Active branch foot, like the cyan └ in OpenClaw configure.
+    _safe_addstr(stdscr, input_y + 1, line_x, "└", current_attr)
+    _safe_addstr(stdscr, input_y + 1, line_x + 1, "─", current_attr)
+
+    hint_y = min(curses.LINES - 3, input_y + 4)
+    required = "required" if not field.get("optional") else "optional"
+    _safe_addstr(stdscr, hint_y, text_x, f"{required} · Enter next · Backspace delete · Ctrl-U clear · Esc cancel", help_attr)
+    if message:
+        _safe_addstr(stdscr, hint_y + 1, text_x, message, warn_attr)
+
+    cursor_offset = len(display) if display and not display.startswith("example:") and not display.startswith("default:") else 0
+    try:
+        stdscr.move(input_y, min(input_x + cursor_offset, curses.COLS - 2))
+    except curses.error:
+        pass
+    stdscr.refresh()
+
+
+def _ask_service_field(
+    stdscr,
+    name: str,
+    config_dir: Path,
+    fields: list[dict],
+    values: list[str],
+    index: int,
+    existing: dict,
+) -> str | None:
+    # Like OpenClaw configure: one focused prompt at a time with previous answers above.
+    field = fields[index]
+    value = "" if field.get("secret") else str(existing.get(field["key"], field.get("default", "")) or "")
+    message = ""
+    while True:
+        _draw_service_step(stdscr, name, config_dir, fields, values, index, value, existing, message)
+        key = stdscr.getch()
+        if key == 27:
+            return None
+        if key in (10, 13, curses.KEY_ENTER):
+            return value
+        if key in (curses.KEY_BACKSPACE, 127, 8):
+            value = value[:-1]
+            message = ""
+        elif key == 21:  # Ctrl-U
+            value = ""
+            message = ""
+        elif 32 <= key <= 126:
+            value += chr(key)
+            message = ""
+
+def _show_tui_message(stdscr, title: str, message: str) -> None:
+    curses.curs_set(0)
+    stdscr.erase()
+    _safe_addstr(stdscr, 0, 0, title, curses.A_BOLD)
+    _safe_addstr(stdscr, 2, 0, message)
+    _safe_addstr(stdscr, 4, 0, "Press any key to continue...")
+    stdscr.refresh()
+    stdscr.getch()
+
+
+def _configure_service_form(stdscr, name: str, config_dir: Path) -> tuple[bool | None, str]:
+    meta = SERVICES[name]
+    cfg_path = config_dir / meta["config_file"]
+    existing = _read_json(cfg_path) if cfg_path.exists() else {}
+    fields = meta["fields"]
+    values: list[str] = []
+
+    for index, field in enumerate(fields):
+        value = _ask_service_field(stdscr, name, config_dir, fields, values, index, existing)
+        if value is None:
+            return None, f"Canceled {meta['label']}"
+        values.append(value)
+
+    while True:
+        cfg = _form_to_config(fields, values, existing)
+        ok, detail = _service_config_valid(name, cfg, cfg_path)
+        if ok:
+            _write_json_secure(cfg_path, cfg)
+            os.environ[meta["env_var"]] = str(cfg_path)
+            _show_tui_message(stdscr, meta["label"], f"✅ Enabled {meta['label']} and saved config")
+            return True, f"Enabled {meta['label']} and saved config"
+
+        _show_tui_message(stdscr, meta["label"], f"⚠️  {detail}")
+        # Re-run the wizard after a validation error so the user can correct one thing at a time.
+        values = []
+        for index, field in enumerate(fields):
+            value = _ask_service_field(stdscr, name, config_dir, fields, values, index, existing)
+            if value is None:
+                return None, f"Canceled {meta['label']}"
+            values.append(value)
+
+
+def _interactive_configure(config_dir: Path, enabled: set[str], initial_services: list[str] | None = None) -> tuple[set[str], bool]:
+    failed = False
+    service_names = list(SERVICES)
+    rows = [*service_names, "all", "done"]
+    selected = 0
+    message = ""
+
+    def loop(stdscr):
+        nonlocal selected, failed, message
+        stdscr.keypad(True)
+        if initial_services:
+            for name in initial_services:
+                result, msg = _configure_service_form(stdscr, name, config_dir)
+                message = msg
+                if result:
+                    enabled.add(name)
+                elif result is False:
+                    failed = True
+            return
+
+        while True:
+            curses.curs_set(0)
+            _draw_configure_tui(stdscr, enabled, selected, message)
+            key = stdscr.getch()
+            if key in (curses.KEY_UP, ord("k")):
+                selected = (selected - 1) % len(rows)
+                message = ""
+            elif key in (curses.KEY_DOWN, ord("j")):
+                selected = (selected + 1) % len(rows)
+                message = ""
+            elif key in (10, 13, curses.KEY_ENTER):
+                row = rows[selected]
+                if row == "done":
+                    return
+                if row == "all":
+                    for name in service_names:
+                        result, msg = _configure_service_form(stdscr, name, config_dir)
+                        message = msg
+                        if result:
+                            enabled.add(name)
+                        elif result is False:
+                            failed = True
+                    continue
+                result, msg = _configure_service_form(stdscr, row, config_dir)
+                message = msg
+                if result:
+                    enabled.add(row)
+                elif result is False:
+                    failed = True
+            elif key in (ord(" "), ord("x")) and rows[selected] in enabled:
+                name = rows[selected]
+                enabled.discard(name)
+                message = f"Disabled {SERVICES[name]['label']} (config file left in place)"
+            elif key in (ord("a"), ord("A")):
+                for name in service_names:
+                    result, msg = _configure_service_form(stdscr, name, config_dir)
+                    message = msg
+                    if result:
+                        enabled.add(name)
+                    elif result is False:
+                        failed = True
+            elif key in (ord("q"), ord("Q"), 27):
+                return
+
+    curses.wrapper(loop)
+    return enabled, failed
+
+def configure(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog="astro-commerce configure",
+        description="Enable commerce services and write the API config files astro-commerce needs.",
+    )
+    parser.add_argument(
+        "--services",
+        help="Comma-separated services to configure immediately: shopify,amazon,stripe,fastspring,appstore, or all. If omitted, opens the arrow-key picker.",
+    )
+    parser.add_argument(
+        "--config-dir",
+        default=str(WORKSPACE),
+        help=f"Directory for service config files (default: {WORKSPACE})",
+    )
+    parser.add_argument(
+        "--db",
+        help=f"SQLite database path to save and initialize (default: {DEFAULT_DB_PATH})",
+    )
+    parser.add_argument(
+        "--enable-only",
+        action="store_true",
+        help="Enable services that already have valid saved credentials without prompting.",
+    )
+    parser.add_argument(
+        "--disable-only",
+        action="store_true",
+        help="Disable selected services without prompting or changing saved credentials.",
+    )
+    parser.add_argument(
+        "--print-form",
+        action="store_true",
+        help="Print JSON form metadata for the selected service and exit.",
+    )
+    parser.add_argument(
+        "--json-stdin",
+        action="store_true",
+        help="Read service config values as JSON from stdin, save them, and enable the selected service.",
+    )
+    args = parser.parse_args(argv)
+
+    if args.enable_only and args.disable_only:
+        print("Error: --enable-only and --disable-only cannot be used together.", file=sys.stderr)
+        return 2
+    if args.print_form and args.json_stdin:
+        print("Error: --print-form and --json-stdin cannot be used together.", file=sys.stderr)
+        return 2
+
+    config_dir = _expand(args.config_dir)
+    astro_config = _read_astro_config()
+    enabled = set(s for s in (astro_config.get("enabled_services") or []) if s in SERVICES)
+    failed = False
+
+    if args.services:
+        try:
+            selected = _parse_services(args.services)
+        except ValueError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            return 2
+        if args.print_form:
+            if len(selected) != 1:
+                print("Error: --print-form requires exactly one service.", file=sys.stderr)
+                return 2
+            print(json.dumps(_configure_form_metadata(selected[0], config_dir), indent=2))
+            return 0
+        if args.json_stdin:
+            if len(selected) != 1:
+                print("Error: --json-stdin requires exactly one service.", file=sys.stderr)
+                return 2
+            try:
+                payload = json.load(sys.stdin)
+            except json.JSONDecodeError as e:
+                print(f"Error: stdin was not valid JSON: {e}", file=sys.stderr)
+                return 2
+            values = payload.get("config", payload) if isinstance(payload, dict) else None
+            if not isinstance(values, dict):
+                print("Error: JSON config must be an object.", file=sys.stderr)
+                return 2
+            ok, detail = _configure_service_from_values(selected[0], values, config_dir)
+            if ok:
+                enabled.add(selected[0])
+                print(detail)
+            else:
+                print(f"Error: {SERVICES[selected[0]]['label']} is not configured: {detail}", file=sys.stderr)
+                failed = True
+        elif not selected:
+            print("No services selected. Nothing changed.")
+            return 0
+        elif args.disable_only:
+            for name in selected:
+                enabled.discard(name)
+                print(f"Disabled {SERVICES[name]['label']}")
+        elif args.enable_only:
+            for name in selected:
+                meta = SERVICES[name]
+                cfg_path = config_dir / meta["config_file"]
+                cfg = _read_json(cfg_path) if cfg_path.exists() else {}
+                ok, detail = _service_config_valid(name, cfg, cfg_path)
+                if ok:
+                    enabled.add(name)
+                    print(f"Enabled {meta['label']} from saved config")
+                else:
+                    print(f"Error: {meta['label']} is not configured: {detail}", file=sys.stderr)
+                    failed = True
+        elif sys.stdin.isatty():
+            enabled, failed = _interactive_configure(config_dir, enabled, initial_services=selected)
+        else:
+            for name in selected:
+                if _configure_service(name, config_dir):
+                    enabled.add(name)
+                else:
+                    failed = True
+    else:
+        if not sys.stdin.isatty():
+            print("Error: configure is interactive. Re-run with --services in a terminal.", file=sys.stderr)
+            return 2
+        enabled, failed = _interactive_configure(config_dir, enabled)
+
+    enabled_list = [name for name in SERVICES if name in enabled]
+    astro_config["enabled_services"] = enabled_list
+    astro_config["config_dir"] = str(config_dir)
+    if args.db:
+        db_path = _expand(args.db)
+    elif sys.stdin.isatty():
+        print()
+        db_path = _prompt_database_path(astro_config)
+    else:
+        db_path = _default_database_path(astro_config)
+    _initialize_database(db_path)
+    astro_config["database_path"] = str(db_path)
+    _write_json_secure(ASTRO_CONFIG_PATH, astro_config)
+
+    print("\nEnabled services: " + (", ".join(enabled_list) if enabled_list else "none"))
+    print(f"Database: {db_path}")
+    print("Next: run `astro-commerce doctor` to verify local config and dependencies.")
+    return 1 if failed else 0
+
+
+def doctor() -> int:
+    _ensure_workspace_config_envs()
+    enabled_services = _read_astro_config().get("enabled_services") or list(SERVICES)
+    enabled_services = [s for s in enabled_services if s in SERVICES]
+    print("astro-commerce doctor\n")
+    if enabled_services:
+        print("Enabled services: " + ", ".join(enabled_services) + "\n")
+    ok = True
+
+    print("Commands:")
+    for key, command in sorted(COMMANDS.items()):
+        exe = command.split()[0]
+        cmd = resolve_command(command)[0]
+        exists = Path(cmd).exists() or shutil.which(exe)
+        status = "✅" if exists else "❌"
+        print(f"  {status} {' '.join(key):<24} -> {exe}")
+        ok = bool(exists) and ok
+
+    print("\nService readiness:")
+    service_checks = {
+        "shopify": _shopify_check,
+        "amazon": _amazon_check,
+        "stripe": _stripe_check,
+        "fastspring": _fastspring_check,
+        "appstore": _appstore_check,
+    }
+    for service in enabled_services:
+        ok = service_checks[service]() and ok
+
+    print("\nDatabase:")
+    ok = _database_check() and ok
+
+    ok = _dependency_checks() and ok
+
+    print("\nNote: doctor verifies local commands, required config fields, key-file presence, database schema, and Python packages. It does not call external APIs.")
+    return 0 if ok else 1
+
+def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    demo = False
+    if "--demo" in argv:
+        demo = True
+        argv = [a for a in argv if a != "--demo"]
+    argv, db_override, db_error = _consume_leading_db_arg(argv)
+    if db_error:
+        print(db_error, file=sys.stderr)
+        return 2
+    if db_override:
+        os.environ["ECOM_DB_PATH"] = str(_expand(db_override))
+        os.environ["ASTRO_COMMERCE_DB_OVERRIDE"] = "1"
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        return print_help()
+    if argv[0] == "commands":
+        return command_help()
+    if argv[0] == "configure":
+        return configure(argv[1:])
+    if argv[0] == "sales":
+        return direct_sales(argv[1:], demo=demo)
+    if argv[0] == "inventory":
+        return direct_inventory(argv[1:], demo=demo)
+    if argv[0] == "inventory-alerts":
+        if demo:
+            print("Error: --demo is not supported for inventory-alerts. Use --db with a demo sync database instead.", file=sys.stderr)
+            return 2
+        return direct_inventory_alerts(argv[1:])
+    if argv[0] == "doctor":
+        return doctor()
+
+    # One-token commands.
+    if (argv[0],) in COMMANDS:
+        return run_command(COMMANDS[(argv[0],)], argv[1:], demo=demo)
+
+    # Two-token channel/resource commands.
+    if len(argv) >= 2 and (argv[0], argv[1]) in COMMANDS:
+        return run_command(COMMANDS[(argv[0], argv[1])], argv[2:], demo=demo)
+
+    print(f"Error: unknown command: {' '.join(argv[:2])}", file=sys.stderr)
+    print("Run `astro-commerce --help` for usage.", file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

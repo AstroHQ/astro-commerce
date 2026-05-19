@@ -1,0 +1,334 @@
+#!/usr/bin/env python3
+"""Shopify Inventory — pull inventory levels from Shopify Admin REST API."""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import io
+import json
+import os
+import re
+import sys
+import time
+from pathlib import Path
+from ecom_table import format_inventory_table
+from datetime import datetime, timezone
+
+try:
+    import requests
+except ImportError:
+    sys.exit("Error: 'requests' package required. Install with: pip install requests")
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
+API_VERSION = "2024-01"
+CONFIG_PATH = Path(os.environ.get("SHOPIFY_API_CONFIG", Path.home() / ".shopify-api.json"))
+
+# Location ID → short name mapping; inactive locations are excluded
+LOCATION_MAP = {
+    6447497275: "ITB",
+    66232352900: "Huboo UK",
+    108729761924: "Huboo NL",
+}
+INACTIVE_LOCATIONS = {66203418756}  # Astropad c/o Giovanni Donelli
+
+
+def load_config() -> dict:
+    cfg = {}
+    if CONFIG_PATH.exists():
+        try:
+            cfg = json.loads(CONFIG_PATH.read_text())
+        except Exception as e:
+            print(f"Warning: could not parse {CONFIG_PATH}: {e}", file=sys.stderr)
+
+    env_map = {
+        "SHOPIFY_STORE": "store",
+        "SHOPIFY_ACCESS_TOKEN": "access_token",
+        "SHOPIFY_API_KEY": "api_key",
+        "SHOPIFY_API_SECRET": "api_secret",
+    }
+    for env_key, cfg_key in env_map.items():
+        val = os.environ.get(env_key)
+        if val:
+            cfg[cfg_key] = val
+
+    return cfg
+
+
+def validate_config(cfg: dict):
+    if not cfg.get("store"):
+        sys.exit("Error: 'store' not set. Configure in ~/.shopify-api.json or set SHOPIFY_STORE.")
+    if not cfg.get("access_token") and not (cfg.get("api_key") and cfg.get("api_secret")):
+        sys.exit(
+            "Error: auth not set. Provide 'api_key'+'api_secret' (recommended) or 'access_token' in ~/.shopify-api.json."
+        )
+
+
+# Cache for client credentials token
+_token_cache = {"token": None, "expires_at": 0}
+
+
+def get_access_token(cfg: dict) -> str:
+    if cfg.get("access_token"):
+        return cfg["access_token"]
+
+    now = time.time()
+    if _token_cache["token"] and _token_cache["expires_at"] > now + 60:
+        return _token_cache["token"]
+
+    store = cfg["store"]
+    resp = requests.post(
+        f"https://{store}/admin/oauth/access_token",
+        json={
+            "client_id": cfg["api_key"],
+            "client_secret": cfg["api_secret"],
+            "grant_type": "client_credentials",
+        },
+        timeout=30,
+    )
+    if resp.status_code != 200:
+        sys.exit(f"Token exchange failed ({resp.status_code}): {resp.text}")
+    data = resp.json()
+    token = data["access_token"]
+    expires_in = data.get("expires_in", 86399)
+    _token_cache["token"] = token
+    _token_cache["expires_at"] = now + expires_in
+    return token
+
+
+# ---------------------------------------------------------------------------
+# Shopify API
+# ---------------------------------------------------------------------------
+
+
+def api_request(cfg: dict, url: str, params: dict = None, retries: int = 3) -> requests.Response:
+    token = get_access_token(cfg)
+    headers = {
+        "Content-Type": "application/json",
+        "X-Shopify-Access-Token": token,
+    }
+    for attempt in range(retries):
+        resp = requests.get(url, headers=headers, params=params, timeout=60)
+        if resp.status_code == 429:
+            retry_after = float(resp.headers.get("Retry-After", 2 * (attempt + 1)))
+            print(f"  Rate limited, waiting {retry_after}s...", file=sys.stderr)
+            time.sleep(retry_after)
+            continue
+        call_limit = resp.headers.get("X-Shopify-Shop-Api-Call-Limit", "")
+        if call_limit:
+            try:
+                used, total = call_limit.split("/")
+                if int(used) >= int(total) - 2:
+                    time.sleep(1)
+            except ValueError:
+                pass
+        return resp
+    return resp
+
+
+# ---------------------------------------------------------------------------
+# Fetch inventory data
+# ---------------------------------------------------------------------------
+
+
+def fetch_locations(cfg: dict) -> list[int]:
+    store = cfg["store"]
+    url = f"https://{store}/admin/api/{API_VERSION}/locations.json"
+    resp = api_request(cfg, url)
+    if resp.status_code != 200:
+        sys.exit(f"Locations API failed ({resp.status_code}): {resp.text}")
+    return [loc["id"] for loc in resp.json().get("locations", [])]
+
+
+def fetch_products(cfg: dict) -> list[dict]:
+    """Fetch all products with variants (paginated). Returns list of variants with sku and inventory_item_id."""
+    store = cfg["store"]
+    url = f"https://{store}/admin/api/{API_VERSION}/products.json"
+    params = {"limit": 250, "fields": "id,variants"}
+    all_variants = []
+
+    while True:
+        print(f"  Fetching products...", file=sys.stderr)
+        resp = api_request(cfg, url, params=params)
+        if resp.status_code != 200:
+            sys.exit(f"Products API failed ({resp.status_code}): {resp.text}")
+
+        products = resp.json().get("products", [])
+        for product in products:
+            for variant in product.get("variants", []):
+                sku = variant.get("sku") or ""
+                inv_item_id = variant.get("inventory_item_id")
+                if inv_item_id:
+                    all_variants.append({"sku": sku, "inventory_item_id": inv_item_id})
+
+        if len(products) < 250:
+            break
+
+        link = resp.headers.get("Link", "")
+        next_match = re.search(r'<([^>]+)>;\s*rel="next"', link)
+        if not next_match:
+            break
+        url = next_match.group(1)
+        params = None
+
+    return all_variants
+
+
+def fetch_inventory_levels(cfg: dict, inventory_item_ids: list[int]) -> dict[int, dict[int, int]]:
+    """Fetch inventory levels for given item IDs, per location.
+    Returns {inventory_item_id: {location_id: quantity}}."""
+    store = cfg["store"]
+    base_url = f"https://{store}/admin/api/{API_VERSION}/inventory_levels.json"
+    levels: dict[int, dict[int, int]] = {}
+
+    # Batch in groups of 50
+    for i in range(0, len(inventory_item_ids), 50):
+        batch = inventory_item_ids[i:i + 50]
+        ids_str = ",".join(str(x) for x in batch)
+        resp = api_request(cfg, base_url, params={"inventory_item_ids": ids_str, "limit": 250})
+        if resp.status_code != 200:
+            sys.exit(f"Inventory Levels API failed ({resp.status_code}): {resp.text}")
+
+        for level in resp.json().get("inventory_levels", []):
+            item_id = level["inventory_item_id"]
+            loc_id = level["location_id"]
+            if loc_id in INACTIVE_LOCATIONS:
+                continue
+            qty = level.get("available", 0) or 0
+            levels.setdefault(item_id, {})[loc_id] = qty
+
+    return levels
+
+
+def fetch_inventory(cfg: dict, sku_filter: str | None = None, location_filter: str | None = None) -> list[dict]:
+    """Fetch inventory for all SKUs per location, optionally filtered."""
+    variants = fetch_products(cfg)
+    print(f"  Found {len(variants)} variants.", file=sys.stderr)
+
+    # Build mapping
+    item_ids = [v["inventory_item_id"] for v in variants]
+    if not item_ids:
+        return []
+
+    print("  Fetching inventory levels...", file=sys.stderr)
+    levels = fetch_inventory_levels(cfg, item_ids)
+
+    items = []
+    for v in variants:
+        sku = v["sku"]
+        if sku_filter and sku_filter.lower() not in sku.lower():
+            continue
+        loc_levels = levels.get(v["inventory_item_id"], {})
+        for loc_id, qty in loc_levels.items():
+            loc_name = LOCATION_MAP.get(loc_id, f"Location {loc_id}")
+            if location_filter and location_filter.lower() != loc_name.lower():
+                continue
+            items.append({"sku": sku or "(no sku)", "on_hand": qty, "location": loc_name})
+
+    items.sort(key=lambda x: (x["sku"].lower(), x["location"]))
+    return items
+
+
+# ---------------------------------------------------------------------------
+# Output
+# ---------------------------------------------------------------------------
+
+
+def format_table(rows: list[dict], group: str = "sku") -> str:
+    return format_inventory_table(rows, group, include_location=True)
+
+def format_csv(rows: list[dict], group: str = "sku") -> str:
+    out = io.StringIO()
+    writer = csv.writer(out)
+    total_on_hand = sum(r["on_hand"] for r in rows)
+
+    if group == "total":
+        writer.writerow(["On-Hand"])
+        writer.writerow([total_on_hand])
+    else:
+        writer.writerow(["SKU", "Location", "On-Hand"])
+        for r in rows:
+            writer.writerow([r["sku"], r.get("location", ""), r["on_hand"]])
+        writer.writerow(["TOTAL", "", total_on_hand])
+    return out.getvalue()
+
+
+def format_json(rows: list[dict], group: str = "sku") -> str:
+    total_on_hand = sum(r["on_hand"] for r in rows)
+    payload = {
+        "group": group,
+        "summary": {"total_on_hand": total_on_hand},
+    }
+    if group != "total":
+        payload["items"] = rows
+    return json.dumps(payload, indent=2)
+
+
+def format_records_payload(rows: list[dict], cfg: dict) -> str:
+    """Canonical source-neutral sync-ingestable JSON payload."""
+    records = []
+    for r in rows:
+        records.append({
+            "sku": r["sku"],
+            "location": r.get("location", ""),
+            "on_hand": int(r["on_hand"]),
+            "inbound": int(r.get("inbound", 0)),
+        })
+    return json.dumps({
+        "schema": "astro.commerce.inventory.v1",
+        "source": "shopify",
+        "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "source_meta": {"store": cfg.get("store")},
+        "records": records,
+        "summary": {
+            "total_on_hand": sum(r["on_hand"] for r in records),
+            "total_inbound": sum(r.get("inbound", 0) for r in records),
+        },
+    }, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Pull inventory levels from Shopify Admin REST API"
+    )
+    parser.add_argument("--sku", "--match", help="Filter by SKU (case-insensitive substring match)")
+    parser.add_argument("--location", help="Filter by location name (e.g. 'ITB', 'Huboo UK', 'Huboo NL')")
+    parser.add_argument(
+        "--group", default="sku", choices=["sku", "total"],
+        help="Aggregation mode (default: sku)",
+    )
+    parser.add_argument(
+        "--output", default="table", choices=["table", "csv", "json", "records"],
+        help="Output format (default: table)",
+    )
+    parser.add_argument("--hide-zero", action="store_true", help="Hide SKUs with 0 inventory")
+    parser.add_argument("--records", action="store_true", help="Output canonical sync-ingestable records JSON")
+    args = parser.parse_args()
+
+    cfg = load_config()
+    validate_config(cfg)
+
+    print("Fetching Shopify inventory...", file=sys.stderr)
+    items = fetch_inventory(cfg, args.sku, args.location)
+
+    if args.hide_zero:
+        items = [r for r in items if r["on_hand"] != 0]
+
+    if args.records or args.output == "records":
+        print(format_records_payload(items, cfg))
+        return
+
+    formatters = {"table": format_table, "csv": format_csv, "json": format_json}
+    print(formatters[args.output](items, args.group))
+
+
+if __name__ == "__main__":
+    main()

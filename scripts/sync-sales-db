@@ -1,0 +1,424 @@
+#!/usr/bin/env python3
+"""Sync commerce sales/inventory records into a local SQLite database."""
+
+import argparse
+import json
+import os
+import sqlite3
+import subprocess
+import sys
+from datetime import datetime, timedelta, timezone
+
+# Ensure sibling scripts and venv are on PATH
+_SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
+_PACKAGE_DIR = os.path.dirname(_SCRIPT_DIR)
+if os.path.basename(_PACKAGE_DIR) == "skills":
+    _WORKSPACE = os.path.dirname(_PACKAGE_DIR)
+elif os.path.basename(os.path.dirname(_PACKAGE_DIR)) == "skills" and os.path.exists(os.path.join(os.path.dirname(os.path.dirname(_PACKAGE_DIR)), "AGENTS.md")):
+    _WORKSPACE = os.path.dirname(os.path.dirname(_PACKAGE_DIR))
+else:
+    _WORKSPACE = _PACKAGE_DIR
+_BIN_DIR = os.path.join(_WORKSPACE, "bin")
+_VENV_BIN = os.path.join(_WORKSPACE, ".venv", "bin")
+_path_prepend = os.pathsep.join(p for p in [_VENV_BIN, _BIN_DIR, _SCRIPT_DIR] if os.path.isdir(p))
+os.environ["PATH"] = _path_prepend + os.pathsep + os.environ.get("PATH", "")
+
+# Ensure API config env vars are set if config files exist in workspace
+if not os.environ.get("SHOPIFY_API_CONFIG"):
+    _shopify_cfg = os.path.join(_WORKSPACE, ".shopify-api.json")
+    if os.path.exists(_shopify_cfg):
+        os.environ["SHOPIFY_API_CONFIG"] = _shopify_cfg
+if not os.environ.get("AMAZON_SP_API_CONFIG"):
+    _amazon_cfg = os.path.join(_WORKSPACE, ".amazon-sp-api.json")
+    if os.path.exists(_amazon_cfg):
+        os.environ["AMAZON_SP_API_CONFIG"] = _amazon_cfg
+if not os.environ.get("STRIPE_API_CONFIG"):
+    _stripe_cfg = os.path.join(_WORKSPACE, ".stripe-api.json")
+    if os.path.exists(_stripe_cfg):
+        os.environ["STRIPE_API_CONFIG"] = _stripe_cfg
+if not os.environ.get("ASC_API_CONFIG"):
+    _appstore_cfg = os.path.join(_WORKSPACE, ".appstore-api.json")
+    if os.path.exists(_appstore_cfg):
+        os.environ["ASC_API_CONFIG"] = _appstore_cfg
+if not os.environ.get("FASTSPRING_API_CONFIG"):
+    _fastspring_cfg = os.path.join(_WORKSPACE, ".fastspring-api.json")
+    if os.path.exists(_fastspring_cfg):
+        os.environ["FASTSPRING_API_CONFIG"] = _fastspring_cfg
+
+ASTRO_CONFIG_PATH = os.path.join(_WORKSPACE, ".astro-commerce.json")
+
+
+def configured_db_path():
+    if os.environ.get("ECOM_DB_PATH"):
+        return os.path.expanduser(os.environ["ECOM_DB_PATH"])
+    try:
+        with open(ASTRO_CONFIG_PATH, "r") as f:
+            data = json.load(f)
+        if data.get("database_path"):
+            return os.path.expanduser(os.path.expandvars(data["database_path"]))
+    except Exception:
+        pass
+    return os.path.expanduser("~/.ecom-sales.db")
+
+
+DB_PATH = configured_db_path()
+DEMO_DB_PATH = os.environ.get("ECOM_DEMO_DB_PATH", os.path.expanduser("~/.ecom-sales-demo.db"))
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS daily_sales (
+    date        TEXT NOT NULL,
+    channel     TEXT NOT NULL,
+    sku         TEXT NOT NULL,
+    units       INTEGER NOT NULL,
+    revenue     REAL NOT NULL,
+    currency    TEXT DEFAULT 'USD',
+    product_type TEXT DEFAULT 'physical',
+    updated_at  TEXT NOT NULL,
+    PRIMARY KEY (date, channel, sku)
+);
+
+CREATE TABLE IF NOT EXISTS daily_inventory (
+    date        TEXT NOT NULL,
+    channel     TEXT NOT NULL,
+    sku         TEXT NOT NULL,
+    location    TEXT NOT NULL DEFAULT '',
+    on_hand     INTEGER NOT NULL,
+    inbound     INTEGER DEFAULT 0,
+    updated_at  TEXT NOT NULL,
+    PRIMARY KEY (date, channel, sku, location)
+);
+
+CREATE TABLE IF NOT EXISTS hidden_skus (
+    sku TEXT PRIMARY KEY
+);
+
+CREATE INDEX IF NOT EXISTS idx_sales_date ON daily_sales(date);
+CREATE INDEX IF NOT EXISTS idx_sales_sku ON daily_sales(sku);
+CREATE INDEX IF NOT EXISTS idx_inventory_date ON daily_inventory(date);
+CREATE INDEX IF NOT EXISTS idx_inventory_sku ON daily_inventory(sku);
+"""
+
+
+
+def configured_channels(default_channels):
+    """Return services enabled by `astro-commerce configure`, or defaults if unset."""
+    try:
+        with open(ASTRO_CONFIG_PATH, "r") as f:
+            data = json.load(f)
+    except Exception:
+        return default_channels
+    enabled = data.get("enabled_services") or []
+    allowed = [ch for ch in enabled if ch in default_channels]
+    return allowed or default_channels
+
+
+def init_db(db_path):
+    db_dir = os.path.dirname(os.path.abspath(os.path.expanduser(db_path)))
+    if db_dir:
+        os.makedirs(db_dir, exist_ok=True)
+    conn = sqlite3.connect(db_path)
+    # Migrate: add location column if missing (old schema didn't have it)
+    try:
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(daily_inventory)").fetchall()]
+        if "location" not in cols and "daily_inventory" in [r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()]:
+            print("Migrating daily_inventory: adding location column...", file=sys.stderr)
+            conn.execute("ALTER TABLE daily_inventory RENAME TO daily_inventory_old")
+            conn.executescript(SCHEMA)
+            conn.execute(
+                "INSERT OR IGNORE INTO daily_inventory (date, channel, sku, location, on_hand, inbound, updated_at) "
+                "SELECT date, channel, sku, '', on_hand, inbound, updated_at FROM daily_inventory_old"
+            )
+            conn.execute("DROP TABLE daily_inventory_old")
+            conn.commit()
+            print("Migration complete.", file=sys.stderr)
+        else:
+            conn.executescript(SCHEMA)
+            conn.commit()
+    except Exception:
+        conn.executescript(SCHEMA)
+        conn.commit()
+
+    # Migrate: add product_type column to daily_sales if missing
+    try:
+        sales_cols = [r[1] for r in conn.execute("PRAGMA table_info(daily_sales)").fetchall()]
+        if "product_type" not in sales_cols and "daily_sales" in [r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()]:
+            print("Migrating daily_sales: adding product_type column...", file=sys.stderr)
+            conn.execute("ALTER TABLE daily_sales ADD COLUMN product_type TEXT DEFAULT 'physical'")
+            conn.commit()
+            print("Migration complete.", file=sys.stderr)
+    except Exception as e:
+        print(f"Warning: product_type migration: {e}", file=sys.stderr)
+
+    return conn
+
+
+def run_tool(cmd):
+    """Run a CLI tool and return parsed JSON, or None on error."""
+    try:
+        result = subprocess.run(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True
+        )
+        if result.returncode != 0:
+            print(f"  ERROR: {cmd[0]} exited with code {result.returncode}", file=sys.stderr)
+            return None
+        return json.loads(result.stdout)
+    except Exception as e:
+        print(f"  ERROR running {cmd[0]}: {e}", file=sys.stderr)
+        return None
+
+
+CHANNEL_PRODUCT_TYPE = {
+    "amazon": "physical",
+    "shopify": "physical",
+    "stripe": "software",
+    "appstore": "software",
+    "fastspring": "software",
+}
+
+
+def _demo_seed(*parts):
+    text = "|".join(str(p) for p in parts if p is not None)
+    return sum((i + 1) * ord(ch) for i, ch in enumerate(text))
+
+
+def _demo_units(*parts, low=1, high=48):
+    return low + (_demo_seed(*parts) % (high - low + 1))
+
+
+def _demo_money(*parts):
+    prices = [9.99, 14.99, 29.99, 49.99, 79.99, 99.99, 129.99]
+    seed = _demo_seed(*parts)
+    return round(prices[seed % len(prices)] * (1 + (seed % 18)), 2)
+
+
+def _demo_payload(payload):
+    out = json.loads(json.dumps(payload))
+    schema = out.get("schema")
+    source = out.get("source")
+    for record in out.get("records") or []:
+        sku = record.get("sku")
+        date = record.get("date")
+        if schema == "astro.commerce.sales.v1":
+            record["quantity"] = _demo_units(source, sku, date, "quantity")
+            record["gross_revenue"] = _demo_money(source, sku, date, "gross_revenue")
+        elif schema == "astro.commerce.inventory.v1":
+            record["on_hand"] = _demo_units(source, sku, record.get("location"), "on_hand", low=0, high=480)
+            record["inbound"] = _demo_units(source, sku, record.get("location"), "inbound", low=0, high=120)
+    records = out.get("records") or []
+    summary = out.setdefault("summary", {})
+    if schema == "astro.commerce.sales.v1":
+        summary["total_units"] = sum(int(r.get("quantity", 0)) for r in records)
+        summary["total_gross_revenue"] = round(sum(float(r.get("gross_revenue", 0)) for r in records), 2)
+    elif schema == "astro.commerce.inventory.v1":
+        summary["total_on_hand"] = sum(int(r.get("on_hand", 0)) for r in records)
+        summary["total_inbound"] = sum(int(r.get("inbound", 0)) for r in records)
+    return out
+
+
+def ingest_payload(conn, payload, inventory_date=None):
+    schema = payload.get("schema")
+    source = payload.get("source")
+    records = payload.get("records") or []
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    if not source:
+        raise ValueError("payload missing source")
+
+    if schema == "astro.commerce.sales.v1":
+        product_type = CHANNEL_PRODUCT_TYPE.get(source, "physical")
+        for record in records:
+            conn.execute(
+                "INSERT OR REPLACE INTO daily_sales (date, channel, sku, units, revenue, currency, product_type, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    record["date"],
+                    source,
+                    record["sku"],
+                    int(record.get("quantity", 0)),
+                    float(record.get("gross_revenue", 0)),
+                    record.get("currency", "USD"),
+                    record.get("product_type", product_type),
+                    now,
+                ),
+            )
+        conn.commit()
+        return len(records)
+
+    if schema == "astro.commerce.inventory.v1":
+        snapshot_date = inventory_date or datetime.now().strftime("%Y-%m-%d")
+        for record in records:
+            conn.execute(
+                "INSERT OR REPLACE INTO daily_inventory (date, channel, sku, location, on_hand, inbound, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    record.get("date", snapshot_date),
+                    source,
+                    record["sku"],
+                    record.get("location", ""),
+                    int(record.get("on_hand", 0)),
+                    int(record.get("inbound", 0)),
+                    now,
+                ),
+            )
+        conn.commit()
+        return len(records)
+
+    raise ValueError(f"unsupported schema: {schema or 'missing'}")
+
+
+def sync_sales(conn, channels, start_date, end_date, demo=False):
+    counts = {}
+
+    for channel in channels:
+        # Apple reports have 1-day delay — clamp end date to yesterday
+        ch_end = end_date
+        if channel == "appstore":
+            yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+            if ch_end > yesterday:
+                ch_end = yesterday
+                print(f"  Note: App Store reports have 1-day delay. Using end={ch_end}.", file=sys.stderr)
+
+        tool = "appstore-sales" if channel == "appstore" else f"{channel}-sales"
+        cmd = [tool, "--start", start_date, "--end", ch_end, "--group", "sku-day", "--output", "records"]
+        data = run_tool(cmd)
+
+        if data is None:
+            counts[channel] = -1
+            continue
+        if demo:
+            data = _demo_payload(data)
+
+        try:
+            counts[channel] = ingest_payload(conn, data)
+        except Exception as e:
+            print(f"  ERROR ingesting {channel} sales: {e}", file=sys.stderr)
+            counts[channel] = -1
+
+    return counts
+
+
+def sync_inventory(conn, channels, demo=False):
+    today = datetime.now().strftime("%Y-%m-%d")
+    counts = {}
+
+    for channel in channels:
+        tool = f"{channel}-inventory"
+        cmd = [tool, "--output", "records"]
+        data = run_tool(cmd)
+        if data is None:
+            counts[channel] = -1
+            continue
+        if demo:
+            data = _demo_payload(data)
+
+        try:
+            counts[channel] = ingest_payload(conn, data, inventory_date=today)
+        except Exception as e:
+            print(f"  ERROR ingesting {channel} inventory: {e}", file=sys.stderr)
+            counts[channel] = -1
+
+    return counts
+
+
+def ingest_main(argv):
+    parser = argparse.ArgumentParser(description="Ingest canonical astro.commerce.*.v1 records JSON into SQLite")
+    parser.add_argument("--db", default=DB_PATH, help="Database path")
+    parser.add_argument("--date", help="Inventory snapshot date (YYYY-MM-DD, default: today)")
+    parser.add_argument("--demo", action="store_true", help="Mask numeric values before ingesting")
+    args = parser.parse_args(argv)
+
+    try:
+        payload = json.load(sys.stdin)
+    except json.JSONDecodeError as e:
+        print(f"Error: stdin was not valid JSON: {e}", file=sys.stderr)
+        return 2
+
+    conn = init_db(args.db)
+    try:
+        if args.demo:
+            payload = _demo_payload(payload)
+        count = ingest_payload(conn, payload, inventory_date=args.date)
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 2
+    finally:
+        conn.close()
+
+    source = payload.get("source", "unknown")
+    schema = payload.get("schema", "unknown")
+    print(f"Ingested {count} {source} records ({schema})")
+    return 0
+
+
+def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "ingest":
+        return ingest_main(sys.argv[2:])
+
+    parser = argparse.ArgumentParser(description="Sync sales & inventory data into SQLite")
+    date_group = parser.add_mutually_exclusive_group()
+    date_group.add_argument("--days", type=int, help="Look back N days")
+    date_group.add_argument("--yesterday", action="store_true", default=False, help="Sync yesterday (default)")
+    date_group.add_argument("--start", help="Start date (YYYY-MM-DD)")
+    parser.add_argument("--end", help="End date (YYYY-MM-DD, default: today)")
+    parser.add_argument("--channel", choices=["amazon", "shopify", "stripe", "appstore", "fastspring", "all"], default="all")
+    parser.add_argument("--skip-sales", action="store_true")
+    parser.add_argument("--skip-inventory", action="store_true")
+    parser.add_argument("--db", default=DB_PATH, help="Database path")
+    parser.add_argument("--demo", action="store_true", help="Mask numeric values and write to demo DB by default")
+    args = parser.parse_args()
+    if args.demo and args.db == DB_PATH:
+        args.db = DEMO_DB_PATH
+
+    # Resolve dates
+    today = datetime.now()
+    if args.start:
+        start_date = args.start
+        end_date = args.end or today.strftime("%Y-%m-%d")
+    elif args.yesterday:
+        yesterday = (today - timedelta(days=1)).strftime("%Y-%m-%d")
+        start_date = yesterday
+        end_date = yesterday
+    elif args.days:
+        start_date = (today - timedelta(days=args.days)).strftime("%Y-%m-%d")
+        end_date = today.strftime("%Y-%m-%d")
+    else:
+        # default: last 3 days (wider window to catch Shopify timezone overlap)
+        start_date = (today - timedelta(days=3)).strftime("%Y-%m-%d")
+        end_date = today.strftime("%Y-%m-%d")
+
+    all_channels = ["amazon", "shopify", "stripe", "appstore", "fastspring"]
+    channels = configured_channels(all_channels) if args.channel == "all" else [args.channel]
+
+    conn = init_db(args.db)
+    had_failure = False
+
+    if not args.skip_sales:
+        sales_counts = sync_sales(conn, channels, start_date, end_date, demo=args.demo)
+        parts = []
+        for ch in channels:
+            c = sales_counts[ch]
+            if c < 0:
+                had_failure = True
+            parts.append(f"{c} {ch} rows" if c >= 0 else f"{ch} FAILED")
+        date_range = start_date if start_date == end_date else f"{start_date} to {end_date}"
+        print(f"Sales synced: {', '.join(parts)} ({date_range})")
+
+    if not args.skip_inventory:
+        # Skip inventory for software-only channels (no physical inventory)
+        inv_channels = [ch for ch in channels if ch not in ("stripe", "appstore", "fastspring")]
+        if inv_channels:
+            inv_counts = sync_inventory(conn, inv_channels, demo=args.demo)
+            parts = []
+            for ch in inv_channels:
+                c = inv_counts[ch]
+                if c < 0:
+                    had_failure = True
+                parts.append(f"{c} {ch} SKUs" if c >= 0 else f"{ch} FAILED")
+            print(f"Inventory synced: {', '.join(parts)} ({today.strftime('%Y-%m-%d')})")
+
+    conn.close()
+    return 1 if had_failure else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

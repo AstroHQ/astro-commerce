@@ -1,0 +1,316 @@
+#!/usr/bin/env python3
+"""Shopify Sales — pull sales data from Shopify Admin REST API."""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import io
+import json
+import os
+import re
+import sys
+import time
+from collections import defaultdict
+from datetime import date, datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
+from pathlib import Path
+from ecom_table import format_sales_table
+from ecom_group import aggregate_sales, aggregate_by_sku_day, aggregate_by_day, aggregate_by_sku, aggregate_total, format_sales_csv, format_sales_json
+
+try:
+    import requests
+except ImportError:
+    sys.exit("Error: 'requests' package required. Install with: pip install requests")
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
+API_VERSION = "2024-01"
+CONFIG_PATH = Path(os.environ.get("SHOPIFY_API_CONFIG", Path.home() / ".shopify-api.json"))
+
+
+def load_config() -> dict:
+    """Load config from file, then overlay environment variables."""
+    cfg = {}
+    if CONFIG_PATH.exists():
+        try:
+            cfg = json.loads(CONFIG_PATH.read_text())
+        except Exception as e:
+            print(f"Warning: could not parse {CONFIG_PATH}: {e}", file=sys.stderr)
+
+    env_map = {
+        "SHOPIFY_STORE": "store",
+        "SHOPIFY_ACCESS_TOKEN": "access_token",
+        "SHOPIFY_API_KEY": "api_key",
+        "SHOPIFY_API_SECRET": "api_secret",
+    }
+    for env_key, cfg_key in env_map.items():
+        val = os.environ.get(env_key)
+        if val:
+            cfg[cfg_key] = val
+
+    return cfg
+
+
+def validate_config(cfg: dict):
+    if not cfg.get("store"):
+        sys.exit("Error: 'store' not set. Configure in ~/.shopify-api.json or set SHOPIFY_STORE.")
+    if not cfg.get("access_token") and not (cfg.get("api_key") and cfg.get("api_secret")):
+        sys.exit(
+            "Error: auth not set. Provide 'api_key'+'api_secret' (recommended) or 'access_token' in ~/.shopify-api.json."
+        )
+
+
+# Cache for client credentials token
+_token_cache = {"token": None, "expires_at": 0}
+
+
+def get_access_token(cfg: dict) -> str:
+    """Get access token via client credentials grant (new Shopify auth as of Jan 2027)."""
+    if cfg.get("access_token"):
+        return cfg["access_token"]
+
+    now = time.time()
+    if _token_cache["token"] and _token_cache["expires_at"] > now + 60:
+        return _token_cache["token"]
+
+    store = cfg["store"]
+    resp = requests.post(
+        f"https://{store}/admin/oauth/access_token",
+        json={
+            "client_id": cfg["api_key"],
+            "client_secret": cfg["api_secret"],
+            "grant_type": "client_credentials",
+        },
+        timeout=30,
+    )
+    if resp.status_code != 200:
+        sys.exit(f"Token exchange failed ({resp.status_code}): {resp.text}")
+    data = resp.json()
+    token = data["access_token"]
+    expires_in = data.get("expires_in", 86399)
+    _token_cache["token"] = token
+    _token_cache["expires_at"] = now + expires_in
+    return token
+
+
+# ---------------------------------------------------------------------------
+# Shopify API
+# ---------------------------------------------------------------------------
+
+
+def api_request(cfg: dict, url: str, params: dict = None, retries: int = 3) -> requests.Response:
+    token = get_access_token(cfg)
+    headers = {
+        "Content-Type": "application/json",
+        "X-Shopify-Access-Token": token,
+    }
+    for attempt in range(retries):
+        resp = requests.get(url, headers=headers, params=params, timeout=60)
+        if resp.status_code == 429:
+            retry_after = float(resp.headers.get("Retry-After", 2 * (attempt + 1)))
+            print(f"  Rate limited, waiting {retry_after}s...", file=sys.stderr)
+            time.sleep(retry_after)
+            continue
+        # Check leaky bucket - if approaching limit, slow down
+        call_limit = resp.headers.get("X-Shopify-Shop-Api-Call-Limit", "")
+        if call_limit:
+            try:
+                used, total = call_limit.split("/")
+                if int(used) >= int(total) - 2:
+                    time.sleep(1)
+            except ValueError:
+                pass
+        return resp
+    return resp
+
+
+STORE_TZ = ZoneInfo("America/Chicago")
+
+
+def _local_iso(datestr: str, timestr: str) -> str:
+    """Build an ISO timestamp in the store's timezone (handles DST)."""
+    dt = datetime.strptime(f"{datestr}T{timestr}", "%Y-%m-%dT%H:%M:%S")
+    dt = dt.replace(tzinfo=STORE_TZ)
+    return dt.isoformat()
+
+
+def fetch_orders(cfg: dict, start: str, end: str) -> list[dict]:
+    """Fetch all orders in date range, handling pagination."""
+    store = cfg["store"]
+    base_url = f"https://{store}/admin/api/{API_VERSION}/orders.json"
+    params = {
+        "status": "any",
+        "created_at_min": _local_iso(start, "00:00:00"),
+        "created_at_max": _local_iso(end, "23:59:59"),
+        "limit": 250,
+    }
+
+    all_orders = []
+    url = base_url
+    page = 1
+
+    while True:
+        print(f"  Fetching orders page {page}...", file=sys.stderr)
+        resp = api_request(cfg, url, params=params)
+        if resp.status_code != 200:
+            sys.exit(f"API error ({resp.status_code}): {resp.text}")
+
+        orders = resp.json().get("orders", [])
+        all_orders.extend(orders)
+
+        if len(orders) < 250:
+            break
+
+        # Pagination via Link header
+        link = resp.headers.get("Link", "")
+        next_match = re.search(r'<([^>]+)>;\s*rel="next"', link)
+        if not next_match:
+            break
+
+        url = next_match.group(1)
+        params = None  # params are in the URL now
+        page += 1
+
+    return all_orders
+
+
+# ---------------------------------------------------------------------------
+# Parse & aggregate
+# ---------------------------------------------------------------------------
+
+
+def extract_line_items(orders: list[dict], sku_pattern: str | None) -> list[dict]:
+    """Extract line items from orders, optionally filtering by SKU."""
+    rows = []
+    for order in orders:
+        raw_date = order.get("created_at", "")
+        if not raw_date:
+            continue
+        # Convert to store timezone for correct date assignment
+        order_dt = datetime.fromisoformat(raw_date)
+        order_date = order_dt.astimezone(STORE_TZ).strftime("%Y-%m-%d")
+        for item in order.get("line_items", []):
+            sku = item.get("sku") or ""
+            if sku_pattern and sku_pattern.lower() not in sku.lower():
+                continue
+            qty = item.get("quantity", 0)
+            price = float(item.get("price", "0"))
+            amount = price * qty
+            rows.append({
+                "date": order_date,
+                "sku": sku or "(no sku)",
+                "quantity": qty,
+                "amount": amount,
+                "currency": order.get("currency", "USD"),
+                "source_order_id": str(order.get("id") or order.get("name") or ""),
+            })
+    return rows
+
+
+# ---------------------------------------------------------------------------
+# Output
+# ---------------------------------------------------------------------------
+
+
+def format_table(rows: list[dict], group: str = "sku-day") -> str:
+    return format_sales_table(rows, group)
+
+def format_csv(rows: list[dict], group: str = "sku-day") -> str:
+    return format_sales_csv(rows, group)
+
+
+def format_json(rows: list[dict], group: str = "sku-day") -> str:
+    return format_sales_json(rows, group)
+
+
+def format_records_payload(rows: list[dict], cfg: dict, start: str, end: str) -> str:
+    """Canonical source-neutral sync-ingestable JSON payload."""
+    records = []
+    for r in rows:
+        records.append({
+            "date": r["date"],
+            "sku": r["sku"],
+            "quantity": int(r["quantity"]),
+            "gross_revenue": round(float(r["amount"]), 2),
+            "currency": r.get("currency", "USD"),
+            "meta": {"source_order_ids": r.get("source_order_ids", [])},
+        })
+    return json.dumps({
+        "schema": "astro.commerce.sales.v1",
+        "source": "shopify",
+        "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "range": {"start": start, "end": end, "timezone": str(STORE_TZ)},
+        "source_meta": {"store": cfg.get("store")},
+        "records": records,
+        "summary": {
+            "total_units": sum(r["quantity"] for r in records),
+            "total_gross_revenue": round(sum(float(r["gross_revenue"]) for r in records), 2),
+        },
+    }, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Pull sales data from Shopify via Admin REST API"
+    )
+    parser.add_argument("--sku", "--match", help="Filter by SKU (case-insensitive substring match)")
+    parser.add_argument("--start", help="Start date (YYYY-MM-DD)")
+    parser.add_argument("--end", default=date.today().isoformat(), help="End date (YYYY-MM-DD, default: today)")
+    parser.add_argument("--days", type=int, help="Convenience: look back N days from today (mutually exclusive with --start)")
+    parser.add_argument("--yesterday", action="store_true", help="Shortcut: pull only yesterday's data")
+    parser.add_argument("--group", "--group-by", default="sku-day", choices=["day", "sku", "sku-day", "total"],
+                        help="Aggregation mode (default: sku-day)")
+    parser.add_argument("--output", default="table", choices=["table", "csv", "json", "records"], help="Output format")
+    parser.add_argument("--records", action="store_true", help="Output canonical sync-ingestable records JSON")
+    args = parser.parse_args()
+
+    # Handle --yesterday / --days / --start
+    date_flags = sum([args.yesterday, args.days is not None, args.start is not None])
+    if date_flags > 1:
+        sys.exit("Error: --yesterday, --days, and --start are mutually exclusive.")
+    if args.yesterday:
+        yesterday = (date.today() - timedelta(days=1)).isoformat()
+        args.start = yesterday
+        args.end = yesterday
+    elif args.days is not None:
+        args.start = (date.today() - timedelta(days=args.days)).isoformat()
+    if not args.start:
+        sys.exit("Error: --start, --days, or --yesterday is required.")
+
+    # Validate dates
+    try:
+        datetime.strptime(args.start, "%Y-%m-%d")
+        datetime.strptime(args.end, "%Y-%m-%d")
+    except ValueError:
+        sys.exit("Error: dates must be YYYY-MM-DD format.")
+
+    cfg = load_config()
+    validate_config(cfg)
+
+    print(f"Fetching Shopify orders {args.start} to {args.end}...", file=sys.stderr)
+    orders = fetch_orders(cfg, args.start, args.end)
+    print(f"  Found {len(orders)} orders.", file=sys.stderr)
+
+    rows = extract_line_items(orders, args.sku)
+
+    records_rows = aggregate_by_sku_day(rows)
+    if args.records or args.output == "records":
+        print(format_records_payload(records_rows, cfg, args.start, args.end))
+        return
+
+    aggregated = aggregate_sales(rows, args.group)
+
+    formatters = {"table": format_table, "csv": format_csv, "json": format_json}
+    print(formatters[args.output](aggregated, args.group))
+
+
+if __name__ == "__main__":
+    main()

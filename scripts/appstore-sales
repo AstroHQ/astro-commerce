@@ -1,0 +1,481 @@
+#!/usr/bin/env python3
+"""App Store Sales — pull sales report data from App Store Connect API."""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import gzip
+import io
+import json
+import os
+import sys
+import time
+from collections import defaultdict
+from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
+from ecom_table import format_sales_table
+from ecom_group import aggregate_sales, aggregate_by_sku_day, aggregate_by_day, aggregate_by_sku, aggregate_total, format_sales_csv, format_sales_json
+
+try:
+    import requests
+except ImportError:
+    sys.exit("Error: 'requests' package required. Install with: pip install requests")
+
+try:
+    import jwt
+    from cryptography.hazmat.primitives import serialization
+except ImportError:
+    sys.exit(
+        "Error: 'PyJWT' and 'cryptography' packages required.\n"
+        "Install with: pip install PyJWT cryptography"
+    )
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
+API_BASE = "https://api.appstoreconnect.apple.com"
+
+
+def load_config() -> dict:
+    """Load App Store Connect config from env vars, config file, or defaults.
+
+    Priority:
+      1. Individual env vars: ASC_ISSUER_ID, ASC_KEY_ID, ASC_PRIVATE_KEY_PATH
+      2. ASC_API_CONFIG env var pointing to a JSON file
+      3. <workspace>/.appstore-api.json (if this script lives in <workspace>/bin/)
+      4. ~/.appstore-api.json
+    """
+    cfg = {}
+
+    # 1. Check individual env vars
+    issuer = os.environ.get("ASC_ISSUER_ID")
+    key_id = os.environ.get("ASC_KEY_ID")
+    key_path = os.environ.get("ASC_PRIVATE_KEY_PATH")
+    vendor = os.environ.get("ASC_VENDOR_NUMBER")
+    if issuer and key_id and key_path:
+        cfg = {"issuer_id": issuer, "key_id": key_id, "private_key_path": key_path}
+        if vendor:
+            cfg["vendor_number"] = vendor
+        return cfg
+
+    # Helper to load from a JSON config file
+    def load_json_config(config_path: Path) -> dict:
+        try:
+            data = json.loads(config_path.read_text())
+            # Resolve private_key_path relative to config file's directory
+            if "private_key_path" in data and not os.path.isabs(data["private_key_path"]):
+                data["private_key_path"] = str(config_path.parent / data["private_key_path"])
+            return data
+        except Exception as e:
+            print(f"Warning: could not parse {config_path}: {e}", file=sys.stderr)
+            return {}
+
+    # 2. ASC_API_CONFIG env var
+    config_env = os.environ.get("ASC_API_CONFIG")
+    if config_env:
+        p = Path(config_env)
+        if p.exists():
+            cfg = load_json_config(p)
+            if cfg:
+                return cfg
+
+    # 3. Workspace config (script is in <workspace>/bin/)
+    script_dir = Path(os.path.dirname(os.path.abspath(__file__)))
+    workspace_cfg = script_dir.parent / ".appstore-api.json"
+    if workspace_cfg.exists():
+        cfg = load_json_config(workspace_cfg)
+        if cfg:
+            return cfg
+
+    # 4. Home directory fallback
+    home_cfg = Path.home() / ".appstore-api.json"
+    if home_cfg.exists():
+        cfg = load_json_config(home_cfg)
+
+    return cfg
+
+
+def validate_config(cfg: dict):
+    missing = []
+    for key in ("issuer_id", "key_id", "private_key_path"):
+        if not cfg.get(key):
+            missing.append(key)
+    if missing:
+        sys.exit(
+            f"Error: Missing App Store Connect config: {', '.join(missing)}.\n"
+            "Set ASC_ISSUER_ID, ASC_KEY_ID, ASC_PRIVATE_KEY_PATH env vars,\n"
+            "or configure .appstore-api.json (see docs)."
+        )
+    key_path = Path(cfg["private_key_path"])
+    if not key_path.exists():
+        sys.exit(f"Error: Private key file not found: {key_path}")
+
+
+# ---------------------------------------------------------------------------
+# JWT & API
+# ---------------------------------------------------------------------------
+
+
+def generate_jwt(cfg: dict) -> str:
+    """Generate a signed JWT for App Store Connect API authentication."""
+    key_path = Path(cfg["private_key_path"])
+    private_key = key_path.read_bytes()
+
+    now = int(time.time())
+    payload = {
+        "iss": cfg["issuer_id"],
+        "exp": now + 20 * 60,  # 20 minutes
+        "aud": "appstoreconnect-v1",
+    }
+    headers = {
+        "alg": "ES256",
+        "kid": cfg["key_id"],
+        "typ": "JWT",
+    }
+    token = jwt.encode(payload, private_key, algorithm="ES256", headers=headers)
+    return token
+
+
+def api_request(cfg: dict, endpoint: str, params: dict = None, retries: int = 3) -> requests.Response:
+    """Make an authenticated GET request to the App Store Connect API with retry logic."""
+    url = f"{API_BASE}{endpoint}"
+    token = generate_jwt(cfg)
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/a-gzip",
+    }
+    for attempt in range(retries):
+        resp = requests.get(url, headers=headers, params=params, timeout=60)
+        if resp.status_code == 429:
+            retry_after = float(resp.headers.get("Retry-After", 2 * (attempt + 1)))
+            print(f"  Rate limited, waiting {retry_after}s...", file=sys.stderr)
+            time.sleep(retry_after)
+            continue
+        return resp
+    return resp
+
+
+# ---------------------------------------------------------------------------
+# Fetch & Parse Sales Reports
+# ---------------------------------------------------------------------------
+
+
+def apple_date_to_iso(date_str: str) -> str:
+    """Convert Apple's MM/DD/YYYY date format to YYYY-MM-DD."""
+    try:
+        dt = datetime.strptime(date_str.strip(), "%m/%d/%Y")
+        return dt.strftime("%Y-%m-%d")
+    except ValueError:
+        return date_str.strip()
+
+
+# ---------------------------------------------------------------------------
+# Currency conversion — live rates from frankfurter.app (free, no key needed)
+# Falls back to cached/hardcoded rates if the API is unreachable.
+# ---------------------------------------------------------------------------
+
+_fx_cache: dict[str, float] = {}  # currency → USD multiplier
+
+# Fallback hardcoded rates (approximate, updated Mar 2026). These cover Apple
+# storefront currencies that are not always returned by frankfurter.app. Keep
+# these seeded even when live rates load; otherwise an unsupported live-rate
+# currency (e.g. KZT/RUB/AED/PEN/COP/NGN/PKR/QAR) gets treated as USD and massively
+# overstates App Store revenue.
+FALLBACK_FX_RATES = {
+    "USD": 1.0, "EUR": 1.15, "GBP": 1.33, "CAD": 0.72, "AUD": 0.69,
+    "JPY": 0.0067, "CHF": 1.25, "SEK": 0.097, "NOK": 0.094, "DKK": 0.154,
+    "BRL": 0.19, "MXN": 0.058, "HUF": 0.0027, "PLN": 0.25, "RON": 0.22,
+    "TRY": 0.028, "HKD": 0.128, "SGD": 0.75, "TWD": 0.031, "KRW": 0.00075,
+    "INR": 0.012, "IDR": 0.000063, "PHP": 0.018, "THB": 0.029, "MYR": 0.22,
+    "VND": 0.000041, "AED": 0.27, "SAR": 0.27, "ILS": 0.28, "ZAR": 0.055,
+    "CLP": 0.0011, "COP": 0.00024, "PEN": 0.27, "EGP": 0.02, "NGN": 0.00065,
+    "NZD": 0.60, "CZK": 0.047, "CNY": 0.145, "BGN": 0.55,
+    "KZT": 0.0020, "RUB": 0.012, "PKR": 0.0036, "QAR": 0.2747,
+}
+
+
+def _fetch_live_rates():
+    """Fetch current FX rates from frankfurter.app. Rates are X per 1 USD."""
+    global _fx_cache
+    if _fx_cache:
+        return  # already fetched this run
+
+    # Seed fallback rates first so currencies missing from the live-rate API
+    # still convert instead of being accidentally treated as USD.
+    _fx_cache.update(FALLBACK_FX_RATES)
+
+    try:
+        resp = requests.get("https://api.frankfurter.app/latest?from=USD", timeout=10)
+        if resp.status_code == 200:
+            data = resp.json()
+            rates = data.get("rates", {})
+            _fx_cache["USD"] = 1.0
+            for curr, per_usd in rates.items():
+                _fx_cache[curr.upper()] = 1.0 / per_usd  # invert: 1 foreign = X USD
+            print(f"  Loaded {len(rates)} live FX rates plus {len(FALLBACK_FX_RATES)} fallbacks.", file=sys.stderr)
+            return
+    except Exception as e:
+        print(f"  Warning: could not fetch live FX rates: {e}", file=sys.stderr)
+
+    print(f"  Using fallback FX rates.", file=sys.stderr)
+
+
+def to_usd(amount: float, currency: str) -> float:
+    """Convert an amount from a given currency to USD using live rates."""
+    _fetch_live_rates()
+    currency = currency.strip().upper()
+    if not currency or currency == "USD":
+        return amount
+    rate = _fx_cache.get(currency)
+    if rate is None:
+        print(f"  Warning: unknown currency '{currency}', treating as USD", file=sys.stderr)
+        return amount
+    return round(amount * rate, 2)
+
+
+# ---------------------------------------------------------------------------
+# SKU mapping: Apple SKU → internal SKU (only revenue-generating Astropad products)
+# ---------------------------------------------------------------------------
+
+APPLE_SKU_MAP = {
+    # Astropad Studio subscriptions
+    "com.astropad.studio.monthly": "studio-monthly",
+    "com.astropad.studio.yearly": "studio-yearly",
+    "com.astropad.studio.yearly-v2": "studio-yearly-v2",
+    "com.astropad.studio.yearly_v2": "studio-yearly-v2",
+    # Rock Planner subscription
+    "com.astropad.rockplanner.year": "rock-planner-yearly",
+    # Astropad Slate one-time purchases
+    "1010": "astropad-slate",
+    "20221221": "astropad-slate-mac",
+}
+
+
+def normalize_sku(sku: str) -> str:
+    """Normalize Apple SKU to our internal format, filtering to known products only.
+    Returns mapped internal SKU or None if not a tracked product."""
+    raw = sku.strip()
+    # Check exact match first (case-sensitive for bundle IDs)
+    if raw in APPLE_SKU_MAP:
+        return APPLE_SKU_MAP[raw]
+    # Try lowercase
+    lower = raw.lower().replace("_", "-")
+    if lower in APPLE_SKU_MAP:
+        return APPLE_SKU_MAP[lower]
+    return None  # Not a tracked product
+
+
+def fetch_daily_report(cfg: dict, report_date: str, vendor: str) -> list[dict]:
+    """Fetch a single day's sales report. Returns parsed rows or empty list."""
+    params = {
+        "filter[reportType]": "SALES",
+        "filter[reportSubType]": "SUMMARY",
+        "filter[frequency]": "DAILY",
+        "filter[reportDate]": report_date,
+        "filter[vendorNumber]": vendor,
+    }
+
+    resp = api_request(cfg, "/v1/salesReports", params=params)
+
+    if resp.status_code == 404:
+        print(f"  Report not available for {report_date} (404)", file=sys.stderr)
+        return []
+    if resp.status_code != 200:
+        # Apple returns JSON errors for non-report responses
+        try:
+            err = resp.json()
+            errors = err.get("errors", [])
+            if errors:
+                detail = errors[0].get("detail", resp.text[:200])
+            else:
+                detail = resp.text[:200]
+        except Exception:
+            detail = resp.text[:200]
+        print(f"  API error for {report_date} ({resp.status_code}): {detail}", file=sys.stderr)
+        return []
+
+    # Response is gzip-compressed TSV
+    try:
+        tsv_data = gzip.decompress(resp.content).decode("utf-8")
+    except Exception:
+        # Maybe it's not gzip'd (some edge cases)
+        tsv_data = resp.text
+
+    rows = []
+    reader = csv.DictReader(io.StringIO(tsv_data), delimiter="\t")
+    for record in reader:
+        try:
+            begin_date = apple_date_to_iso(record.get("Begin Date", ""))
+            raw_sku = record.get("SKU", "").strip()
+            sku = normalize_sku(raw_sku)
+            if sku is None:
+                continue  # Not a tracked Astropad product
+
+            units = int(record.get("Units", "0"))
+            customer_price = float(record.get("Customer Price", "0"))
+            currency = record.get("Customer Currency", "USD").strip()
+            total_local = round(customer_price * units, 2)
+            total_usd = to_usd(total_local, currency)
+
+            if units == 0:
+                continue
+
+            rows.append({
+                "date": begin_date,
+                "sku": sku,
+                "quantity": units,
+                "amount": total_usd,
+                "currency": "USD",
+            })
+        except (ValueError, KeyError) as e:
+            print(f"  Warning: skipping malformed row: {e}", file=sys.stderr)
+            continue
+
+    return rows
+
+
+def fetch_sales(cfg: dict, start: str, end: str, vendor: str) -> list[dict]:
+    """Fetch sales reports for a date range (one request per day)."""
+    start_dt = datetime.strptime(start, "%Y-%m-%d").date()
+    end_dt = datetime.strptime(end, "%Y-%m-%d").date()
+
+    all_rows = []
+    current = start_dt
+    while current <= end_dt:
+        date_str = current.isoformat()
+        print(f"  Fetching report for {date_str}...", file=sys.stderr)
+        rows = fetch_daily_report(cfg, date_str, vendor)
+        all_rows.extend(rows)
+        current += timedelta(days=1)
+
+    return all_rows
+
+
+# ---------------------------------------------------------------------------
+# Aggregate
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Output
+# ---------------------------------------------------------------------------
+
+
+def format_table(rows: list[dict], group: str = "sku-day") -> str:
+    return format_sales_table(rows, group)
+
+def format_csv(rows: list[dict], group: str = "sku-day") -> str:
+    return format_sales_csv(rows, group)
+
+
+def format_json(rows: list[dict], group: str = "sku-day") -> str:
+    return format_sales_json(rows, group)
+
+
+def format_records_payload(rows: list[dict], source: str, start: str, end: str, source_meta: dict | None = None) -> str:
+    """Canonical source-neutral sync-ingestable JSON payload."""
+    records = []
+    for r in rows:
+        records.append({
+            "date": r["date"],
+            "sku": r["sku"],
+            "quantity": int(r["quantity"]),
+            "gross_revenue": round(float(r["amount"]), 2),
+            "currency": r.get("currency", "USD"),
+        })
+    return json.dumps({
+        "schema": "astro.commerce.sales.v1",
+        "source": source,
+        "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "range": {"start": start, "end": end},
+        "source_meta": source_meta or {},
+        "records": records,
+        "summary": {
+            "total_units": sum(r["quantity"] for r in records),
+            "total_gross_revenue": round(sum(float(r["gross_revenue"]) for r in records), 2),
+        },
+    }, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Pull sales report data from App Store Connect API"
+    )
+    parser.add_argument("--sku", "--match", help="Filter by SKU (case-insensitive substring match)")
+    parser.add_argument("--start", help="Start date (YYYY-MM-DD)")
+    parser.add_argument("--end", default=date.today().isoformat(), help="End date (YYYY-MM-DD, default: today)")
+    parser.add_argument("--days", type=int, help="Look back N days from today")
+    parser.add_argument("--yesterday", action="store_true", help="Shortcut: pull only yesterday's data")
+    parser.add_argument("--vendor", help="Apple vendor number (overrides config/env)")
+    parser.add_argument("--group", "--group-by", default="sku-day", choices=["day", "sku", "sku-day", "total"],
+                        help="Aggregation mode (default: sku-day)")
+    parser.add_argument("--output", default="table", choices=["table", "csv", "json", "records"], help="Output format")
+    parser.add_argument("--records", action="store_true", help="Output canonical sync-ingestable records JSON (alias for --output records)")
+    args = parser.parse_args()
+
+    # Handle --yesterday / --days / --start
+    date_flags = sum([args.yesterday, args.days is not None, args.start is not None])
+    if date_flags > 1:
+        sys.exit("Error: --yesterday, --days, and --start are mutually exclusive.")
+    if args.yesterday:
+        yesterday = (date.today() - timedelta(days=1)).isoformat()
+        args.start = yesterday
+        args.end = yesterday
+    elif args.days is not None:
+        args.start = (date.today() - timedelta(days=args.days)).isoformat()
+    if not args.start:
+        sys.exit("Error: --start, --days, or --yesterday is required.")
+
+    # Apple reports have a 1-day delay — clamp end date to yesterday
+    yesterday = (date.today() - timedelta(days=1)).isoformat()
+    if args.end > yesterday:
+        print(f"  Note: Apple reports have 1-day delay. Clamping end date to {yesterday}.", file=sys.stderr)
+        args.end = yesterday
+
+    # Validate dates
+    try:
+        datetime.strptime(args.start, "%Y-%m-%d")
+        datetime.strptime(args.end, "%Y-%m-%d")
+    except ValueError:
+        sys.exit("Error: dates must be YYYY-MM-DD format.")
+
+    cfg = load_config()
+    validate_config(cfg)
+
+    # Resolve vendor number: CLI flag > config > env var
+    vendor = args.vendor or cfg.get("vendor_number") or os.environ.get("ASC_VENDOR_NUMBER")
+    if not vendor:
+        sys.exit(
+            "Error: Vendor number not found. Use --vendor flag,\n"
+            "set ASC_VENDOR_NUMBER env var, or add 'vendor_number' to config file."
+        )
+
+    print(f"Fetching App Store sales {args.start} to {args.end}...", file=sys.stderr)
+    rows = fetch_sales(cfg, args.start, args.end, vendor)
+    print(f"  Found {len(rows)} line items.", file=sys.stderr)
+
+    # Apply SKU filter
+    if args.sku:
+        pattern = args.sku.lower()
+        rows = [r for r in rows if pattern in r["sku"].lower()]
+
+    records_rows = aggregate_by_sku_day(rows)
+    if args.records or args.output == "records":
+        print(format_records_payload(records_rows, "appstore", args.start, args.end, {"vendor_number": vendor}))
+        return
+
+    aggregated = aggregate_sales(rows, args.group)
+
+    formatters = {"table": format_table, "csv": format_csv, "json": format_json}
+    print(formatters[args.output](aggregated, args.group))
+
+
+if __name__ == "__main__":
+    main()

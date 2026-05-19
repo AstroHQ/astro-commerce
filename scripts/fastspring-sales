@@ -1,0 +1,294 @@
+#!/usr/bin/env python3
+"""FastSpring Sales — pull revenue data from FastSpring Data API."""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import io
+import json
+import os
+import sys
+import time
+from collections import defaultdict
+from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
+from ecom_table import format_sales_table
+from ecom_group import aggregate_sales, aggregate_by_sku_day, aggregate_by_day, aggregate_by_sku, aggregate_total, format_sales_csv, format_sales_json
+
+try:
+    import requests
+except ImportError:
+    sys.exit("Error: 'requests' package required. Install with: pip install requests")
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
+API_BASE = "https://api.fastspring.com"
+
+# Map FastSpring product_path → internal SKU
+PRODUCT_PATH_TO_SKU = {
+    "astropad-studio": "fs-studio-yearly",
+    "astropad-studio-no-trial": "fs-studio-yearly",
+    "astropad-studio-one-time": "fs-studio-onetime",
+    "astropad-studio-monthly": "fs-studio-monthly",
+    "astropad-studio-monthly-no-trial": "fs-studio-monthly",
+    "astropad-studio-education": "fs-studio-education",
+    "astropad-studio-enterprise": "fs-studio-enterprise",
+}
+
+
+def load_config() -> dict:
+    """Load FastSpring API credentials.
+
+    Priority: FASTSPRING_API_CONFIG env → workspace .fastspring-api.json → ~/.fastspring-api.json
+    """
+    cfg = {}
+
+    # 1. FASTSPRING_API_CONFIG env var pointing to a JSON file
+    config_path = os.environ.get("FASTSPRING_API_CONFIG")
+    if config_path:
+        try:
+            cfg = json.loads(Path(config_path).read_text())
+            if cfg.get("username") and cfg.get("password"):
+                return cfg
+        except Exception as e:
+            print(f"Warning: could not parse {config_path}: {e}", file=sys.stderr)
+
+    # 2. Workspace .fastspring-api.json (look in script's parent dir)
+    script_dir = Path(os.path.abspath(__file__)).parent
+    workspace_path = script_dir.parent / ".fastspring-api.json"
+    if workspace_path.exists():
+        try:
+            cfg = json.loads(workspace_path.read_text())
+            if cfg.get("username") and cfg.get("password"):
+                return cfg
+        except Exception as e:
+            print(f"Warning: could not parse {workspace_path}: {e}", file=sys.stderr)
+
+    # 3. ~/.fastspring-api.json
+    home_path = Path.home() / ".fastspring-api.json"
+    if home_path.exists():
+        try:
+            cfg = json.loads(home_path.read_text())
+        except Exception as e:
+            print(f"Warning: could not parse {home_path}: {e}", file=sys.stderr)
+
+    return cfg
+
+
+def validate_config(cfg: dict):
+    if not cfg.get("username") or not cfg.get("password"):
+        sys.exit(
+            "Error: FastSpring API credentials not found. "
+            "Set FASTSPRING_API_CONFIG env var to a JSON file, "
+            "or create .fastspring-api.json in the workspace or home directory "
+            'with {"username": "...", "password": "..."}.'
+        )
+
+
+# ---------------------------------------------------------------------------
+# FastSpring API
+# ---------------------------------------------------------------------------
+
+
+def api_request(cfg: dict, endpoint: str, payload: dict, retries: int = 3) -> requests.Response:
+    """Make an authenticated POST request to the FastSpring Data API with retry logic."""
+    url = f"{API_BASE}{endpoint}"
+    headers = {
+        "Content-Type": "application/json",
+        "User-Agent": "Astrobot/1.0",
+    }
+    auth = (cfg["username"], cfg["password"])
+
+    for attempt in range(retries):
+        resp = requests.post(url, json=payload, headers=headers, auth=auth, timeout=60)
+        if resp.status_code == 429:
+            retry_after = float(resp.headers.get("Retry-After", 2 * (attempt + 1)))
+            print(f"  Rate limited, waiting {retry_after}s...", file=sys.stderr)
+            time.sleep(retry_after)
+            continue
+        return resp
+    return resp
+
+
+def fetch_revenue(cfg: dict, start: str, end: str) -> list[dict]:
+    """Fetch all revenue report rows in date range, handling pagination."""
+    all_rows = []
+    page = 1
+    page_count = 1000
+
+    while True:
+        print(f"  Fetching revenue page {page}...", file=sys.stderr)
+        payload = {
+            "filter": {"startDate": start, "endDate": end},
+            "reportColumns": ["Product_Name", "Product_Path", "Transaction_Date", "Income_in_USD", "Product_Units"],
+            "groupBy": ["Product_Name", "Product_Path", "Transaction_Date"],
+            "pageCount": page_count,
+            "pageNumber": page,
+            "async": False,
+        }
+        resp = api_request(cfg, "/data/v1/revenue", payload)
+        if resp.status_code != 200:
+            sys.exit(f"API error ({resp.status_code}): {resp.text}")
+
+        data = resp.json()
+        rows = data.get("report", [])
+        all_rows.extend(rows)
+
+        total_rows = data.get("totalRows", 0)
+        if len(all_rows) >= total_rows or not rows:
+            break
+
+        page += 1
+
+    return all_rows
+
+
+# ---------------------------------------------------------------------------
+# Parse & aggregate
+# ---------------------------------------------------------------------------
+
+
+def map_to_sales_rows(report_rows: list[dict], sku_pattern: str | None) -> list[dict]:
+    """Convert FastSpring report rows to normalized sales rows."""
+    rows = []
+    for entry in report_rows:
+        product_path = entry.get("product_path", "")
+        sku = PRODUCT_PATH_TO_SKU.get(product_path)
+        if not sku:
+            # Try partial matches from most-specific to least-specific. Some paths
+            # share prefixes (for example astropad-studio and
+            # astropad-studio-monthly), so insertion order would misclassify
+            # more specific products.
+            for path_key, mapped_sku in sorted(
+                PRODUCT_PATH_TO_SKU.items(), key=lambda item: len(item[0]), reverse=True
+            ):
+                if path_key in product_path:
+                    sku = mapped_sku
+                    break
+        if not sku:
+            continue  # Unknown product, skip
+
+        if sku_pattern and sku_pattern.lower() not in sku.lower():
+            continue
+
+        tx_date = entry.get("transaction_date", "")
+        income = float(entry.get("income_in_usd", 0))
+        units = float(entry.get("product_units", 0))
+
+        rows.append({
+            "date": tx_date,
+            "sku": sku,
+            "quantity": int(units),
+            "amount": round(income, 2),
+            "currency": "USD",
+        })
+
+    return rows
+
+
+# ---------------------------------------------------------------------------
+# Output
+# ---------------------------------------------------------------------------
+
+
+def format_table(rows: list[dict], group: str = "sku-day") -> str:
+    return format_sales_table(rows, group)
+
+def format_csv(rows: list[dict], group: str = "sku-day") -> str:
+    return format_sales_csv(rows, group)
+
+
+def format_json(rows: list[dict], group: str = "sku-day") -> str:
+    return format_sales_json(rows, group)
+
+
+def format_records_payload(rows: list[dict], source: str, start: str, end: str, source_meta: dict | None = None) -> str:
+    """Canonical source-neutral sync-ingestable JSON payload."""
+    records = []
+    for r in rows:
+        records.append({
+            "date": r["date"],
+            "sku": r["sku"],
+            "quantity": int(r["quantity"]),
+            "gross_revenue": round(float(r["amount"]), 2),
+            "currency": r.get("currency", "USD"),
+        })
+    return json.dumps({
+        "schema": "astro.commerce.sales.v1",
+        "source": source,
+        "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "range": {"start": start, "end": end},
+        "source_meta": source_meta or {},
+        "records": records,
+        "summary": {
+            "total_units": sum(r["quantity"] for r in records),
+            "total_gross_revenue": round(sum(float(r["gross_revenue"]) for r in records), 2),
+        },
+    }, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Pull revenue data from FastSpring Data API"
+    )
+    parser.add_argument("--match", "--sku", help="Filter by SKU (case-insensitive substring match)")
+    parser.add_argument("--start", help="Start date (YYYY-MM-DD)")
+    parser.add_argument("--end", default=date.today().isoformat(), help="End date (YYYY-MM-DD, default: today)")
+    parser.add_argument("--days", type=int, help="Convenience: look back N days from today (mutually exclusive with --start)")
+    parser.add_argument("--yesterday", action="store_true", help="Shortcut: pull only yesterday's data")
+    parser.add_argument("--group", "--group-by", default="sku-day", choices=["day", "sku", "sku-day", "total"],
+                        help="Aggregation mode (default: sku-day)")
+    parser.add_argument("--output", default="table", choices=["table", "csv", "json", "records"], help="Output format")
+    parser.add_argument("--records", action="store_true", help="Output canonical sync-ingestable records JSON (alias for --output records)")
+    args = parser.parse_args()
+
+    # Handle --yesterday / --days / --start
+    date_flags = sum([args.yesterday, args.days is not None, args.start is not None])
+    if date_flags > 1:
+        sys.exit("Error: --yesterday, --days, and --start are mutually exclusive.")
+    if args.yesterday:
+        yesterday = (date.today() - timedelta(days=1)).isoformat()
+        args.start = yesterday
+        args.end = yesterday
+    elif args.days is not None:
+        args.start = (date.today() - timedelta(days=args.days)).isoformat()
+    if not args.start:
+        sys.exit("Error: --start, --days, or --yesterday is required.")
+
+    # Validate dates
+    try:
+        datetime.strptime(args.start, "%Y-%m-%d")
+        datetime.strptime(args.end, "%Y-%m-%d")
+    except ValueError:
+        sys.exit("Error: dates must be YYYY-MM-DD format.")
+
+    cfg = load_config()
+    validate_config(cfg)
+
+    print(f"Fetching FastSpring revenue {args.start} to {args.end}...", file=sys.stderr)
+    report_rows = fetch_revenue(cfg, args.start, args.end)
+    print(f"  Found {len(report_rows)} report rows.", file=sys.stderr)
+
+    rows = map_to_sales_rows(report_rows, args.match)
+
+    records_rows = aggregate_by_sku_day(rows)
+    if args.records or args.output == "records":
+        print(format_records_payload(records_rows, "fastspring", args.start, args.end))
+        return
+
+    aggregated = aggregate_sales(rows, args.group)
+
+    formatters = {"table": format_table, "csv": format_csv, "json": format_json}
+    print(formatters[args.output](aggregated, args.group))
+
+
+if __name__ == "__main__":
+    main()

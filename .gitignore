@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.DS_Store
+
+# Local credentials and databases
+.*-api.json
+.astro-commerce.json
+.ecom-sales*.db
+*.sqlite
+*.sqlite3
+*.db
+
+# Generated output
+*.png
+*.csv
+*.log
