@@ -1,17 +1,21 @@
 # Astro Commerce
 
-Astro Commerce is a Codex/OpenClaw skill and Python CLI for pulling, syncing, charting, and inspecting commerce data across Astropad sales channels.
+Astro Commerce is a Codex/OpenClaw skill and Python CLI for pulling, syncing, charting, and inspecting commerce data across sales and inventory channels like Shopify, Amazon, App Store, Stripe etc.
 
-It supports:
+**Supported channels**
 
-- Shopify sales and inventory
-- Amazon Seller Central sales and inventory through SP-API
-- Stripe sales
-- App Store Connect sales
-- FastSpring sales
+- Amazon
+- Shopify
+- Stripe
+- App Store
+- Fastspring
+
+**Features**
+
+- Sales and inventory reporting
+- Built in charts
 - SQLite sync for unified reporting
 - CSV/table/JSON/records output
-- Demo-safe masked output
 - Inventory alert calculations
 
 ## Quick Start
@@ -80,25 +84,7 @@ Representative output:
 +----------------------+-------+-----------+
 ```
 
-### Daily Report Pipeline
-
-```bash
-demo/scripts/daily-revenue-report.sh
-```
-
-Representative output:
-
-```text
-Sales synced: amazon OK, shopify OK, stripe OK, appstore OK, fastspring OK (2026-05-18)
-Inventory synced: amazon OK, shopify OK (2026-05-19)
-shopify|$12,418.92|217
-amazon|$8,734.11|164
-stripe|$2,129.00|38
-appstore|$1,840.52|93
-fastspring|$1,112.45|12
-```
-
-### Slack Report Hook
+### Slack Example Report
 
 ```bash
 export SLACK_WEBHOOK_URL="<your Slack incoming webhook URL>"
@@ -116,7 +102,7 @@ Slack message shape:
 - fastspring: $1,112.45 / 12 units
 ```
 
-### Inventory Alert Digest
+### Inventory Alert Report
 
 ```bash
 demo/scripts/inventory-alerts-slack.sh
@@ -137,59 +123,17 @@ Representative Slack output:
 PRODUCT_MATCH=luna CHANNEL=shopify OUT=luna-shopify-30d.png demo/scripts/product-trend-chart.sh
 ```
 
-Representative output:
-
-```text
-Wrote luna-shopify-30d.png
-```
-
 ![Luna Shopify 30-day revenue chart](demo/assets/luna-shopify-30d.png)
-
-### Composable ETL
-
-```bash
-CHANNEL=stripe demo/scripts/composable-etl.sh
-```
-
-Representative records payload:
-
-```json
-{
-  "schema": "astro.commerce.sales.v1",
-  "channel": "stripe",
-  "records": [
-    {
-      "date": "2026-05-18",
-      "sku": "studio-yearly",
-      "units": 12,
-      "revenue": 779.88
-    }
-  ],
-  "summary": {
-    "units": 12,
-    "revenue": 779.88
-  }
-}
-```
-
-Use `--demo` to mask sales, revenue, unit, and inventory numbers with deterministic demo values:
-
-```bash
-astro-commerce --demo shopify sales --days 30 --group sku
-astro-commerce --demo sync run --days 30
-```
-
-Demo sync writes to `~/.ecom-sales-demo.db` by default. Use `--db PATH` or `ECOM_DEMO_DB_PATH` to choose another database.
 
 ## Configuration
 
 Configure the default SQLite database:
 
 ```bash
-astro-commerce configure --db ~/.ecom-sales.db
+astro-commerce configure
 ```
 
-Credential files and environment variables are intentionally not committed. Channel setup is documented here:
+Credential files and environment variables are intentionally not committed. Channel options are documented here:
 
 - [Shopify sales](docs/shopify-revenue.md)
 - [Shopify inventory](docs/shopify-stock.md)
