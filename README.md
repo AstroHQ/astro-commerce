@@ -28,12 +28,10 @@ cd astro-commerce
 python3 -m pip install --user -r requirements.txt
 ```
 
-Run the CLI directly from the repo:
+First run configure to enable the services you want:
 
 ```bash
-scripts/astro-commerce doctor
-scripts/astro-commerce --demo shopify sales --days 30 --group sku
-scripts/astro-commerce --demo sync run --days 30
+scripts/astro-commerce configure
 ```
 
 To install command shims into your local workspace:
@@ -46,7 +44,7 @@ After installation:
 
 ```bash
 astro-commerce doctor
-astro-commerce --demo amazon inventory --output records
+astro-commerce --demo shopify sales --yesterday --group sku
 ```
 
 ## Common Commands
