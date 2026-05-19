@@ -57,105 +57,117 @@ astro-commerce sync run --channel all --days 7
 astro-commerce inventory-alerts --output json
 ```
 
-## Example Workflows
+## Examples and Output
 
-### Daily Revenue Snapshot
+Longer runnable examples live in [demo/](demo/), including Slack webhook posting, chart generation, composable ETL, and daily report scripts.
 
-Sync all configured channels, then print yesterday's revenue by channel from SQLite:
+### Sales by SKU
 
 ```bash
-astro-commerce sync run --channel all --yesterday
-
-sqlite3 ~/.ecom-sales.db '
-  SELECT channel, printf("$%.2f", SUM(revenue)) AS revenue, SUM(units) AS units
-  FROM daily_sales
-  WHERE date = date("now", "-1 day")
-  GROUP BY channel
-  ORDER BY SUM(revenue) DESC;
-'
+astro-commerce --demo shopify sales --days 7 --group sku
 ```
 
-### Post a Slack Daily Report
+Representative output:
 
-Use an incoming webhook and keep the webhook URL in the environment:
+```text
++----------------------+-------+-----------+
+| SKU                  | Units | Revenue   |
++----------------------+-------+-----------+
+| luna-display-usb-c   |    42 | $4,117.82 |
+| rpp-ipad-pro-13      |    31 | $2,904.15 |
+| fresh-coat-13        |    18 | $1,026.40 |
+| TOTAL                |    91 | $8,048.37 |
++----------------------+-------+-----------+
+```
+
+### Daily Report Pipeline
+
+```bash
+demo/scripts/daily-revenue-report.sh
+```
+
+Representative output:
+
+```text
+Sales synced: amazon OK, shopify OK, stripe OK, appstore OK, fastspring OK (2026-05-18)
+Inventory synced: amazon OK, shopify OK (2026-05-19)
+shopify|$12,418.92|217
+amazon|$8,734.11|164
+stripe|$2,129.00|38
+appstore|$1,840.52|93
+fastspring|$1,112.45|12
+```
+
+### Slack Report Hook
 
 ```bash
 export SLACK_WEBHOOK_URL="<your Slack incoming webhook URL>"
-
-astro-commerce sync run --channel all --yesterday
-
-export REPORT=$(
-  sqlite3 ~/.ecom-sales.db '
-    SELECT "- " || channel || ": $" || printf("%.2f", SUM(revenue)) || " / " || SUM(units) || " units"
-    FROM daily_sales
-    WHERE date = date("now", "-1 day")
-    GROUP BY channel
-    ORDER BY SUM(revenue) DESC;
-  '
-)
-
-python3 - <<'PY'
-import json
-import os
-import urllib.request
-
-title = "Daily commerce report"
-report = os.environ["REPORT"]
-payload = json.dumps({"text": f"*{title}*\n{report}"}).encode()
-req = urllib.request.Request(
-    os.environ["SLACK_WEBHOOK_URL"],
-    data=payload,
-    headers={"Content-Type": "application/json"},
-)
-urllib.request.urlopen(req, timeout=15).read()
-PY
+demo/scripts/slack-daily-report.sh
 ```
 
-### Product Trend Chart
+Slack message shape:
 
-Generate a PNG chart from live channel data:
-
-```bash
-astro-commerce shopify sales --days 30 --match "luna" --group day --output csv \
-  | astro-commerce chart --title "Luna Shopify Revenue - Last 30 Days" --type line -o luna-shopify-30d.png
+```text
+*Daily commerce report*
+- shopify: $12,418.92 / 217 units
+- amazon: $8,734.11 / 164 units
+- stripe: $2,129.00 / 38 units
+- appstore: $1,840.52 / 93 units
+- fastspring: $1,112.45 / 12 units
 ```
 
 ### Inventory Alert Digest
 
-Sync sales and inventory, then produce action items for stock planning:
-
 ```bash
-astro-commerce sync run --channel all --days 30
-astro-commerce inventory-alerts --days 30 --output slack
+demo/scripts/inventory-alerts-slack.sh
 ```
 
-To post those alerts to Slack:
+Representative Slack output:
+
+```text
+*Inventory alerts*
+- HIGH shopify / ITB / rpp-ipad-pro-13: 6 days remaining, reorder 240 units
+- MED amazon / FBA / luna-display-usb-c: 13 days remaining, reorder 120 units
+- WATCH shopify / Warehouse / fresh-coat-13: 24 days remaining
+```
+
+### Product Trend Chart
 
 ```bash
-export ALERTS=$(astro-commerce inventory-alerts --days 30 --output slack)
-curl -X POST -H "Content-Type: application/json" \
-  --data "$(python3 -c 'import json, os; print(json.dumps({"text": os.environ["ALERTS"]}))')" \
-  "$SLACK_WEBHOOK_URL"
+PRODUCT_MATCH=luna CHANNEL=shopify OUT=luna-shopify-30d.png demo/scripts/product-trend-chart.sh
+```
+
+Representative output:
+
+```text
+Wrote luna-shopify-30d.png
 ```
 
 ### Composable ETL
 
-Pull from one source, inspect the records payload, then ingest it into the shared database:
-
 ```bash
-astro-commerce stripe sales --yesterday --output records > stripe-yesterday.json
-python3 -m json.tool stripe-yesterday.json | head -40
-astro-commerce sync ingest < stripe-yesterday.json
+CHANNEL=stripe demo/scripts/composable-etl.sh
 ```
 
-### Demo Without Exposing Real Numbers
+Representative records payload:
 
-Keep real SKUs, channels, dates, and locations while masking revenue, units, and stock counts:
-
-```bash
-astro-commerce --db /tmp/commerce-demo.db --demo sync run --days 45
-astro-commerce --db /tmp/commerce-demo.db --demo shopify sales --days 30 --group sku
-astro-commerce --db /tmp/commerce-demo.db inventory-alerts --output json
+```json
+{
+  "schema": "astro.commerce.sales.v1",
+  "channel": "stripe",
+  "records": [
+    {
+      "date": "2026-05-18",
+      "sku": "studio-yearly",
+      "units": 12,
+      "revenue": 779.88
+    }
+  ],
+  "summary": {
+    "units": 12,
+    "revenue": 779.88
+  }
+}
 ```
 
 Use `--demo` to mask sales, revenue, unit, and inventory numbers with deterministic demo values:
