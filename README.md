@@ -143,6 +143,8 @@ Representative output:
 Wrote luna-shopify-30d.png
 ```
 
+![Luna Shopify 30-day revenue chart](demo/assets/luna-shopify-30d.png)
+
 ### Composable ETL
 
 ```bash
